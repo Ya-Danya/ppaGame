@@ -2,10 +2,11 @@ package com.example.paperfx.server;
 
 import com.example.paperfx.common.Messages;
 import com.example.paperfx.common.Net;
-import com.google.gson.JsonObject;
+import com.fasterxml.jackson.databind.JsonNode;
 
 import java.io.*;
 import java.net.*;
+import java.sql.SQLException;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -16,13 +17,14 @@ public final class ServerMain {
     private static final int CELL = 10;
     private static final int GRID_W = 80;
     private static final int GRID_H = 60;
-    private static final double WORLD_W = GRID_W * (double) CELL;
-    private static final double WORLD_H = GRID_H * (double) CELL;
 
     private static final double PLAYER_SIZE = 16;
-    private static final double PLAYER_SPEED = 240; // px/s
+    private static final double PLAYER_SPEED = 240;
 
     private static final int SPAWN_R = 3;
+
+    private static final int LEADERBOARD_LIMIT = 10;
+    private static final long LEADERBOARD_REFRESH_MS = 2000;
 
     private final int port;
     private final ServerSocket serverSocket;
@@ -30,19 +32,32 @@ public final class ServerMain {
     private final CopyOnWriteArrayList<ClientConn> clients = new CopyOnWriteArrayList<>();
     private final ConcurrentHashMap<String, PlayerEntity> players = new ConcurrentHashMap<>();
 
-    private final int[] owners = new int[GRID_W * GRID_H]; // 0=none, else idx
+    private final int[] owners = new int[GRID_W * GRID_H];
 
     private final Random rnd = new Random();
     private final AtomicLong tick = new AtomicLong(0);
     private final AtomicInteger nextIdx = new AtomicInteger(1);
 
+    private final Db db;
+    private volatile List<Messages.LeaderEntry> cachedLeaderboard = List.of();
+    private volatile long lastLbMs = 0;
+
     public static void main(String[] args) throws Exception {
         int port = args.length >= 1 ? Integer.parseInt(args[0]) : 7777;
-        new ServerMain(port).start();
+
+        String dbUrl = envOr("DB_URL", "jdbc:postgresql://localhost:5432/paperfx");
+        String dbUser = envOr("DB_USER", "paperfx");
+        String dbPass = envOr("DB_PASS", "paperfx");
+
+        ServerMain s = new ServerMain(port, new Db(dbUrl, dbUser, dbPass));
+        s.start();
     }
 
-    public ServerMain(int port) throws IOException {
+    public ServerMain(int port, Db db) throws IOException, SQLException {
         this.port = port;
+        this.db = db;
+        this.db.init();
+
         this.serverSocket = new ServerSocket();
         this.serverSocket.bind(new InetSocketAddress("0.0.0.0", port));
     }
@@ -60,7 +75,7 @@ public final class ServerMain {
             return t;
         });
 
-        final long periodMs = 50; // 20 TPS
+        final long periodMs = 50;
         final long[] lastNs = { System.nanoTime() };
 
         loop.scheduleAtFixedRate(() -> {
@@ -69,12 +84,19 @@ public final class ServerMain {
             lastNs[0] = now;
 
             step(dt);
+            refreshLeaderboardIfNeeded();
             broadcastState();
         }, 0, periodMs, TimeUnit.MILLISECONDS);
 
-        try {
-            while (true) Thread.sleep(10_000);
-        } catch (InterruptedException ignored) {}
+        try { while (true) Thread.sleep(10_000); } catch (InterruptedException ignored) {}
+    }
+
+    private void refreshLeaderboardIfNeeded() {
+        long now = System.currentTimeMillis();
+        if (now - lastLbMs < LEADERBOARD_REFRESH_MS) return;
+        lastLbMs = now;
+        try { cachedLeaderboard = db.topBest(LEADERBOARD_LIMIT); }
+        catch (SQLException e) { System.err.println("[server] leaderboard error: " + e.getMessage()); }
     }
 
     private void acceptLoop() {
@@ -103,78 +125,66 @@ public final class ServerMain {
             int oldCx = p.cellX;
             int oldCy = p.cellY;
 
-            double vx = p.inputDx * PLAYER_SPEED;
-            double vy = p.inputDy * PLAYER_SPEED;
-            p.x = clamp(p.x + vx * dt, 0, WORLD_W - PLAYER_SIZE);
-            p.y = clamp(p.y + vy * dt, 0, WORLD_H - PLAYER_SIZE);
+            p.x = clamp(p.x + (p.inputDx * PLAYER_SPEED) * dt, 0, GRID_W * (double) CELL - PLAYER_SIZE);
+            p.y = clamp(p.y + (p.inputDy * PLAYER_SPEED) * dt, 0, GRID_H * (double) CELL - PLAYER_SIZE);
 
-            int newCx = (int) Math.floor((p.x + PLAYER_SIZE / 2.0) / CELL);
-            int newCy = (int) Math.floor((p.y + PLAYER_SIZE / 2.0) / CELL);
-            newCx = clampInt(newCx, 0, GRID_W - 1);
-            newCy = clampInt(newCy, 0, GRID_H - 1);
+            int newCx = clampInt((int) Math.floor((p.x + PLAYER_SIZE / 2.0) / CELL), 0, GRID_W - 1);
+            int newCy = clampInt((int) Math.floor((p.y + PLAYER_SIZE / 2.0) / CELL), 0, GRID_H - 1);
 
             if (newCx != oldCx || newCy != oldCy) {
-                // walk all crossed cells so trail has no gaps
                 for (int[] c : bresenham(oldCx, oldCy, newCx, newCy)) {
-                    // skip the first point (old cell): it was already processed previously
                     if (c[0] == oldCx && c[1] == oldCy) continue;
                     p.cellX = c[0];
                     p.cellY = c[1];
                     onEnterCell(p, c[0], c[1]);
                 }
             }
+
+            p.score = countTerritoryCells(p.idx);
         }
         tick.incrementAndGet();
     }
 
+    private int countTerritoryCells(int idx) {
+        int n = 0;
+        for (int o : owners) if (o == idx) n++;
+        return n;
+    }
+
     private void onEnterCell(PlayerEntity mover, int x, int y) {
-        // if mover enters someone else's trail -> trail owner dies
         for (PlayerEntity other : players.values()) {
             if (other.idx == mover.idx) continue;
             if (other.deadCooldownTicks > 0) continue;
             if (other.trailSet.contains(key(x, y))) {
-                killAndRespawn(other, "trail intersected by " + mover.name);
+                killAndRespawn(other, "trail intersected by " + mover.username);
             }
         }
 
         int idx = mover.idx;
         boolean inOwnTerritory = owners[toIndex(x, y)] == idx;
-
         boolean inOwnTrailBefore = mover.trailSet.contains(key(x, y));
 
         if (!inOwnTerritory) {
             addTrailCell(mover, x, y);
-
-            // self-intersection closes loop
-            if (inOwnTrailBefore && mover.trailList.size() >= 4) {
-                captureLoopGlobal(mover);
-            }
+            if (inOwnTrailBefore && mover.trailList.size() >= 4) captureLoopGlobal(mover);
         } else {
-            // return to own territory closes loop
-            if (!mover.trailList.isEmpty()) {
-                captureLoopGlobal(mover);
-            }
+            if (!mover.trailList.isEmpty()) captureLoopGlobal(mover);
         }
     }
 
     private void addTrailCell(PlayerEntity p, int x, int y) {
         long k = key(x, y);
-        if (p.trailSet.add(k)) {
-            p.trailList.add(new Messages.Cell(x, y));
-        }
+        if (p.trailSet.add(k)) p.trailList.add(new Messages.Cell(x, y));
     }
 
     private void killAndRespawn(PlayerEntity victim, String reason) {
         int idx = victim.idx;
+        try { db.recordResult(victim.userId, victim.score); }
+        catch (SQLException e) { System.err.println("[server] recordResult error: " + e.getMessage()); }
 
-        // wipe territory
-        for (int i = 0; i < owners.length; i++) {
-            if (owners[i] == idx) owners[i] = 0;
-        }
+        for (int i = 0; i < owners.length; i++) if (owners[i] == idx) owners[i] = 0;
         victim.clearTrail();
-        victim.score = 0;
 
-        // respawn
         int sx = rnd.nextInt(GRID_W);
         int sy = rnd.nextInt(GRID_H);
         victim.x = sx * CELL + (CELL - PLAYER_SIZE) / 2.0;
@@ -184,33 +194,20 @@ public final class ServerMain {
         giveInitialTerritory(idx, sx, sy);
 
         victim.deadCooldownTicks = 10;
-        System.out.println("[server] " + victim.name + " died: " + reason);
+        System.out.println("[server] " + victim.username + " died: " + reason);
     }
 
-    /**
-     * Global capture:
-     * blocked = (owners==idx) OR (trail)
-     * flood from border through NOT blocked => outside
-     * not blocked & not outside => enclosed => becomes idx
-     *
-     * Points gained = number of cells set to idx that previously were not idx (including trail).
-     */
     private void captureLoopGlobal(PlayerEntity p) {
         int idx = p.idx;
         if (p.trailList.size() < 2) { p.clearTrail(); return; }
 
         boolean[] blocked = new boolean[owners.length];
-        for (int i = 0; i < owners.length; i++) {
-            if (owners[i] == idx) blocked[i] = true;
-        }
-        for (Messages.Cell c : p.trailList) {
-            blocked[toIndex(c.x, c.y)] = true;
-        }
+        for (int i = 0; i < owners.length; i++) if (owners[i] == idx) blocked[i] = true;
+        for (Messages.Cell c : p.trailList) blocked[toIndex(c.x, c.y)] = true;
 
         boolean[] outside = new boolean[owners.length];
         ArrayDeque<Integer> q = new ArrayDeque<>();
 
-        // border seeds
         for (int x = 0; x < GRID_W; x++) {
             pushIfOpen(q, outside, blocked, toIndex(x, 0));
             pushIfOpen(q, outside, blocked, toIndex(x, GRID_H - 1));
@@ -222,37 +219,28 @@ public final class ServerMain {
 
         while (!q.isEmpty()) {
             int cur = q.removeFirst();
-            int x = cur % GRID_W;
-            int y = cur / GRID_W;
+            int cx = cur % GRID_W;
+            int cy = cur / GRID_W;
 
-            if (x > 0) pushIfOpen(q, outside, blocked, cur - 1);
-            if (x + 1 < GRID_W) pushIfOpen(q, outside, blocked, cur + 1);
-            if (y > 0) pushIfOpen(q, outside, blocked, cur - GRID_W);
-            if (y + 1 < GRID_H) pushIfOpen(q, outside, blocked, cur + GRID_W);
+            if (cx > 0) pushIfOpen(q, outside, blocked, cur - 1);
+            if (cx + 1 < GRID_W) pushIfOpen(q, outside, blocked, cur + 1);
+            if (cy > 0) pushIfOpen(q, outside, blocked, cur - GRID_W);
+            if (cy + 1 < GRID_H) pushIfOpen(q, outside, blocked, cur + GRID_W);
         }
 
-        int gained = 0;
-
-        // enclosed
         for (int i = 0; i < owners.length; i++) {
             if (blocked[i] || outside[i]) continue;
-            if (owners[i] != idx) gained++;
-            owners[i] = idx;
+            if (owners[i] == 0) owners[i] = idx;
         }
-
-        // trail becomes territory too
         for (Messages.Cell c : p.trailList) {
             int i = toIndex(c.x, c.y);
-            if (owners[i] != idx) gained++;
-            owners[i] = idx;
+            if (owners[i] == 0) owners[i] = idx;
         }
 
-        p.score += gained;
         p.clearTrail();
     }
 
     private static void pushIfOpen(ArrayDeque<Integer> q, boolean[] outside, boolean[] blocked, int i) {
-        if (i < 0) return;
         if (blocked[i] || outside[i]) return;
         outside[i] = true;
         q.addLast(i);
@@ -264,14 +252,18 @@ public final class ServerMain {
         List<Messages.Player> ps = new ArrayList<>();
         for (PlayerEntity p : players.values()) {
             List<Messages.Cell> trail = p.trailList.isEmpty() ? null : new ArrayList<>(p.trailList);
-            ps.add(new Messages.Player(p.id, p.idx, p.name, p.x, p.y, p.score, p.color, trail));
+            ps.add(new Messages.Player(p.playerId, p.idx, p.username, p.x, p.y, p.score, p.color, trail));
         }
         ps.sort(Comparator.comparingInt((Messages.Player pp) -> pp.score).reversed());
 
-        Messages.State msg = new Messages.State(tick.get(), CELL, GRID_W, GRID_H, ownersSnap, ps);
+        Messages.State msg = new Messages.State(tick.get(), CELL, GRID_W, GRID_H, ownersSnap, ps, cachedLeaderboard);
 
-        String line = Net.toJson(msg);
-        for (ClientConn c : clients) c.send(line);
+        try {
+            String line = Net.toJson(msg);
+            for (ClientConn c : clients) c.send(line);
+        } catch (Exception e) {
+            System.err.println("[server] json encode error: " + e.getMessage());
+        }
     }
 
     private static double clamp(double v, double lo, double hi) { return Math.max(lo, Math.min(hi, v)); }
@@ -288,7 +280,6 @@ public final class ServerMain {
         }
     }
 
-    // Bresenham line between grid cells (inclusive)
     private static List<int[]> bresenham(int x0, int y0, int x1, int y1) {
         ArrayList<int[]> out = new ArrayList<>();
         int dx = Math.abs(x1 - x0);
@@ -308,10 +299,19 @@ public final class ServerMain {
         return out;
     }
 
+    private static String envOr(String k, String def) {
+        String v = System.getenv(k);
+        return (v == null || v.isBlank()) ? def : v.trim();
+    }
+
     private final class ClientConn {
         private final Socket socket;
         private final BufferedReader in;
         private final PrintWriter out;
+
+        private volatile boolean authed = false;
+        private volatile String userId;
+        private volatile String username;
         private volatile String playerId;
 
         ClientConn(Socket socket) throws IOException {
@@ -332,20 +332,14 @@ public final class ServerMain {
             try {
                 String line;
                 while ((line = in.readLine()) != null) {
-                    JsonObject o = Net.parse(line);
-                    String type = o.get("type").getAsString();
-                    if ("hello".equals(type)) {
-                        String name = o.has("name") ? o.get("name").getAsString() : "player";
-                        onHello(name);
-                    } else if ("input".equals(type)) {
-                        if (playerId == null) continue;
-                        int dx = o.get("dx").getAsInt();
-                        int dy = o.get("dy").getAsInt();
-                        PlayerEntity p = players.get(playerId);
-                        if (p != null) {
-                            p.inputDx = clampDir(dx);
-                            p.inputDy = clampDir(dy);
-                        }
+                    JsonNode o = Net.parse(line);
+                    String type = o.path("type").asText("");
+                    switch (type) {
+                        case "register" -> onRegister(o);
+                        case "login" -> onLogin(o);
+                        case "input" -> onInput(o);
+                        case "leaderboard_req" -> onLeaderboardReq(o);
+                        default -> sendSafe(new Messages.Error("unknown message type: " + type));
                     }
                 }
             } catch (SocketTimeoutException e) {
@@ -357,34 +351,80 @@ public final class ServerMain {
             }
         }
 
-        private void onHello(String name) {
-            if (playerId != null) return;
+        private void onRegister(JsonNode o) {
+            String u = o.path("username").asText("");
+            String p = o.path("password").asText("");
+            try {
+                Db.RegisterResult r = db.register(u, p);
+                if (!r.ok()) { sendSafe(new Messages.Error(r.error())); return; }
+                onLogin(o);
+            } catch (SQLException e) {
+                sendSafe(new Messages.Error("db error: " + e.getMessage()));
+            }
+        }
 
-            String id = UUID.randomUUID().toString();
-            int idx = nextIdx.getAndIncrement();
-            String color = randomColorHex();
+        private void onLogin(JsonNode o) {
+            String u = o.path("username").asText("");
+            String p = o.path("password").asText("");
+            try {
+                Db.LoginResult r = db.login(u, p);
+                if (!r.ok()) { sendSafe(new Messages.Error(r.error())); return; }
 
-            int sx = rnd.nextInt(GRID_W);
-            int sy = rnd.nextInt(GRID_H);
+                this.authed = true;
+                this.userId = r.userId();
+                this.username = r.username();
 
-            double x = sx * CELL + (CELL - PLAYER_SIZE) / 2.0;
-            double y = sy * CELL + (CELL - PLAYER_SIZE) / 2.0;
+                String pid = UUID.randomUUID().toString();
+                int idx = nextIdx.getAndIncrement();
+                String color = randomColorHex();
 
-            PlayerEntity p = new PlayerEntity(id, idx, name, x, y, color, sx, sy);
-            players.put(id, p);
-            playerId = id;
+                int sx = rnd.nextInt(GRID_W);
+                int sy = rnd.nextInt(GRID_H);
 
-            giveInitialTerritory(idx, sx, sy);
-            send(Net.toJson(new Messages.Welcome(id, idx, color)));
+                double px = sx * CELL + (CELL - PLAYER_SIZE) / 2.0;
+                double py = sy * CELL + (CELL - PLAYER_SIZE) / 2.0;
 
-            System.out.println("[server] hello from " + name + " idx=" + idx + " id=" + id);
+                PlayerEntity pe = new PlayerEntity(userId, username, pid, idx, color, px, py, sx, sy);
+                players.put(pid, pe);
+                this.playerId = pid;
+
+                giveInitialTerritory(idx, sx, sy);
+                sendSafe(new Messages.AuthOk(userId, username, pid, idx, color, r.bestScore()));
+                System.out.println("[server] auth ok: " + username + " idx=" + idx);
+            } catch (SQLException e) {
+                sendSafe(new Messages.Error("db error: " + e.getMessage()));
+            }
+        }
+
+        private void onInput(JsonNode o) {
+            if (!authed || playerId == null) { sendSafe(new Messages.Error("not authenticated")); return; }
+            int dx = clampDir(o.path("dx").asInt(0));
+            int dy = clampDir(o.path("dy").asInt(0));
+            PlayerEntity p = players.get(playerId);
+            if (p != null) { p.inputDx = dx; p.inputDy = dy; }
+        }
+
+        private void onLeaderboardReq(JsonNode o) {
+            int limit = Math.max(1, Math.min(o.path("limit").asInt(10), 50));
+            try { cachedLeaderboard = db.topBest(limit); }
+            catch (SQLException e) { sendSafe(new Messages.Error("db error: " + e.getMessage())); }
         }
 
         private void cleanup() {
             clients.remove(this);
-            if (playerId != null) players.remove(playerId);
+            if (playerId != null) {
+                PlayerEntity p = players.remove(playerId);
+                if (p != null) {
+                    try { db.recordResult(p.userId, p.score); }
+                    catch (SQLException e) { System.err.println("[server] recordResult(disconnect) error: " + e.getMessage()); }
+                }
+            }
             try { socket.close(); } catch (IOException ignored) {}
             System.out.println("[server] client disconnected: " + socket.getRemoteSocketAddress());
+        }
+
+        private void sendSafe(Object msg) {
+            try { send(Net.toJson(msg)); } catch (Exception ignored) {}
         }
 
         private int clampDir(int v) { return v < 0 ? -1 : (v > 0 ? 1 : 0); }
@@ -398,15 +438,18 @@ public final class ServerMain {
     }
 
     private static final class PlayerEntity {
-        final String id;
+        final String userId;
+        final String username;
+
+        final String playerId;
         final int idx;
-        final String name;
         final String color;
 
         volatile double x, y;
         volatile int inputDx = 0, inputDy = 0;
 
         volatile int score = 0;
+
         volatile int cellX;
         volatile int cellY;
 
@@ -415,11 +458,17 @@ public final class ServerMain {
         final HashSet<Long> trailSet = new HashSet<>();
         final ArrayList<Messages.Cell> trailList = new ArrayList<>();
 
-        PlayerEntity(String id, int idx, String name, double x, double y, String color, int cellX, int cellY) {
-            this.id = id; this.idx = idx; this.name = name;
-            this.x = x; this.y = y;
+        PlayerEntity(String userId, String username, String playerId, int idx, String color,
+                     double x, double y, int cellX, int cellY) {
+            this.userId = userId;
+            this.username = username;
+            this.playerId = playerId;
+            this.idx = idx;
             this.color = color;
-            this.cellX = cellX; this.cellY = cellY;
+            this.x = x;
+            this.y = y;
+            this.cellX = cellX;
+            this.cellY = cellY;
         }
 
         void clearTrail() { trailSet.clear(); trailList.clear(); }

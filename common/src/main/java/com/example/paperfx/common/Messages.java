@@ -12,11 +12,28 @@ public final class Messages {
         public Cell() {}
     }
 
+    public static final class LeaderEntry {
+        public String username;
+        public int bestScore;
+        public LeaderEntry(String username, int bestScore) { this.username = username; this.bestScore = bestScore; }
+        public LeaderEntry() {}
+    }
+
     // client -> server
-    public static final class Hello {
-        public final String type = "hello";
-        public String name;
-        public Hello(String name) { this.name = name; }
+    public static final class Register {
+        public final String type = "register";
+        public String username;
+        public String password;
+        public Register(String username, String password) { this.username = username; this.password = password; }
+        public Register() {}
+    }
+
+    public static final class Login {
+        public final String type = "login";
+        public String username;
+        public String password;
+        public Login(String username, String password) { this.username = username; this.password = password; }
+        public Login() {}
     }
 
     public static final class Input {
@@ -24,33 +41,62 @@ public final class Messages {
         public int dx;
         public int dy;
         public Input(int dx, int dy) { this.dx = dx; this.dy = dy; }
+        public Input() {}
+    }
+
+    public static final class LeaderboardReq {
+        public final String type = "leaderboard_req";
+        public int limit = 10;
+        public LeaderboardReq(int limit) { this.limit = limit; }
+        public LeaderboardReq() {}
     }
 
     // server -> client
-    public static final class Welcome {
-        public final String type = "welcome";
-        public String id;
+    public static final class Error {
+        public final String type = "error";
+        public String reason;
+        public Error(String reason) { this.reason = reason; }
+        public Error() {}
+    }
+
+    public static final class AuthOk {
+        public final String type = "auth_ok";
+        public String userId;
+        public String username;
+        public String playerId;
         public int idx;
         public String color;
-        public Welcome(String id, int idx, String color) {
-            this.id = id; this.idx = idx; this.color = color;
+        public int bestScore;
+
+        public AuthOk(String userId, String username, String playerId, int idx, String color, int bestScore) {
+            this.userId = userId;
+            this.username = username;
+            this.playerId = playerId;
+            this.idx = idx;
+            this.color = color;
+            this.bestScore = bestScore;
         }
+        public AuthOk() {}
     }
 
     public static final class Player {
-        public String id;
+        public String playerId;
         public int idx;
-        public String name;
+        public String username;
         public double x;
         public double y;
-        public int score; // points for NEWLY captured cells
+        public int score; // current territory size (cells)
         public String color;
         public List<Cell> trail;
 
-        public Player(String id, int idx, String name, double x, double y, int score, String color, List<Cell> trail) {
-            this.id = id; this.idx = idx; this.name = name;
-            this.x = x; this.y = y;
-            this.score = score; this.color = color;
+        public Player(String playerId, int idx, String username, double x, double y, int score, String color, List<Cell> trail) {
+            this.playerId = playerId;
+            this.idx = idx;
+            this.username = username;
+            this.x = x;
+            this.y = y;
+            this.score = score;
+            this.color = color;
             this.trail = trail;
         }
         public Player() {}
@@ -59,21 +105,21 @@ public final class Messages {
     public static final class State {
         public final String type = "state";
         public long tick;
-
         public int cellSize;
         public int gridW;
         public int gridH;
         public int[] owners;
-
         public List<Player> players;
+        public List<LeaderEntry> leaderboard;
 
-        public State(long tick, int cellSize, int gridW, int gridH, int[] owners, List<Player> players) {
+        public State(long tick, int cellSize, int gridW, int gridH, int[] owners, List<Player> players, List<LeaderEntry> leaderboard) {
             this.tick = tick;
             this.cellSize = cellSize;
             this.gridW = gridW;
             this.gridH = gridH;
             this.owners = owners;
             this.players = players;
+            this.leaderboard = leaderboard;
         }
         public State() {}
     }
