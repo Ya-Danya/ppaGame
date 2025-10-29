@@ -25,10 +25,13 @@ public final class ClientMain extends Application {
     private int lastDx = 0;
     private int lastDy = 0;
 
+    private long lastPingNs = 0;
+
     @Override
     public void start(Stage stage) {
-        stage.setTitle("PaperFX v0.6 — Auth + PostgreSQL + Leaderboard");
-        stage.setScene(buildScene(stage));
+        stage.setTitle("PaperFX v0.6.1 — Auth + PostgreSQL + Leaderboard");
+        Scene scene = buildScene(stage);
+        stage.setScene(scene);
         stage.setWidth(1180);
         stage.setHeight(820);
         stage.show();
@@ -37,9 +40,27 @@ public final class ClientMain extends Application {
     private Scene buildScene(Stage stage) {
         TextField host = new TextField("127.0.0.1");
         TextField port = new TextField("7777");
-        TextField username = new TextField("user1");
+
+        TextField username = new TextField();
         PasswordField password = new PasswordField();
-        password.setText("password");
+
+        // "show password" UI: PasswordField + TextField bound to same text
+        TextField passwordVisible = new TextField();
+        passwordVisible.textProperty().bindBidirectional(password.textProperty());
+
+        ToggleButton showPass = new ToggleButton("👁");
+        showPass.setFocusTraversable(false);
+        showPass.setTooltip(new Tooltip("Показать/скрыть пароль"));
+
+        passwordVisible.managedProperty().bind(showPass.selectedProperty());
+        passwordVisible.visibleProperty().bind(showPass.selectedProperty());
+
+        password.managedProperty().bind(showPass.selectedProperty().not());
+        password.visibleProperty().bind(showPass.selectedProperty().not());
+
+        StackPane passStack = new StackPane(password, passwordVisible);
+        HBox passBox = new HBox(8, passStack, showPass);
+        HBox.setHgrow(passStack, Priority.ALWAYS);
 
         Label netStatus = new Label("not connected");
         Label authInfo = new Label("auth: -");
@@ -47,7 +68,12 @@ public final class ClientMain extends Application {
         err.setTextFill(Color.ORANGERED);
 
         Button connect = new Button("Connect");
+        Button login = new Button("Login");
+        Button register = new Button("Register");
+        Button refreshLb = new Button("Refresh leaderboard");
+
         connect.setOnAction(e -> {
+            err.setText("");
             connect.setDisable(true);
             try {
                 client = new NetworkClient(host.getText().trim(), Integer.parseInt(port.getText().trim()));
@@ -58,20 +84,21 @@ public final class ClientMain extends Application {
             }
         });
 
-        Button login = new Button("Login");
         login.setDefaultButton(true);
         login.setOnAction(e -> {
+            err.setText("");
             if (client == null) { err.setText("connect first"); return; }
+            if (client.auth.get() != null) return; // already logged in
             client.send(new Messages.Login(username.getText().trim(), password.getText()));
         });
 
-        Button register = new Button("Register");
         register.setOnAction(e -> {
+            err.setText("");
             if (client == null) { err.setText("connect first"); return; }
+            if (client.auth.get() != null) return; // already logged in
             client.send(new Messages.Register(username.getText().trim(), password.getText()));
         });
 
-        Button refreshLb = new Button("Refresh leaderboard");
         refreshLb.setOnAction(e -> {
             if (client == null) return;
             client.send(new Messages.LeaderboardReq(10));
@@ -80,10 +107,11 @@ public final class ClientMain extends Application {
         GridPane form = new GridPane();
         form.setHgap(10);
         form.setVgap(10);
+
         form.addRow(0, new Label("Host:"), host, connect, netStatus);
         form.addRow(1, new Label("Port:"), port);
         form.addRow(2, new Label("Username:"), username);
-        form.addRow(3, new Label("Password:"), password);
+        form.addRow(3, new Label("Password:"), passBox);
         form.addRow(4, login, register);
         form.addRow(5, refreshLb);
 
@@ -91,6 +119,8 @@ public final class ClientMain extends Application {
         lbList.setPrefHeight(240);
 
         Canvas canvas = new Canvas(800, 600);
+        canvas.setFocusTraversable(true);
+        canvas.setOnMouseClicked(e -> canvas.requestFocus());
         GraphicsContext g = canvas.getGraphicsContext2D();
 
         BorderPane root = new BorderPane();
@@ -103,14 +133,27 @@ public final class ClientMain extends Application {
                 lbList
         );
         left.setPadding(new Insets(12));
-        left.setPrefWidth(340);
+        left.setPrefWidth(360);
 
         root.setLeft(left);
         root.setCenter(new StackPane(canvas));
 
         Scene scene = new Scene(root);
+
         scene.setOnKeyPressed(e -> { keysDown.add(e.getCode()); updateInput(); });
         scene.setOnKeyReleased(e -> { keysDown.remove(e.getCode()); updateInput(); });
+
+        // when app loses focus, stop movement to avoid "stuck keys"
+        stage.focusedProperty().addListener((obs, was, focused) -> {
+            if (!focused) {
+                keysDown.clear();
+                lastDx = 0;
+                lastDy = 0;
+                if (client != null && client.auth.get() != null) client.send(new Messages.Input(0, 0));
+            } else {
+                Platform.runLater(canvas::requestFocus);
+            }
+        });
 
         new AnimationTimer() {
             @Override public void handle(long now) {
@@ -118,18 +161,35 @@ public final class ClientMain extends Application {
                     renderNoState(g, "connect to server");
                     return;
                 }
+
+                // periodic keepalive to keep server connection "warm"
+                if (now - lastPingNs > 5_000_000_000L) {
+                    lastPingNs = now;
+                    client.send(new Messages.Ping());
+                }
+
                 Messages.AuthOk a = client.auth.get();
-                if (a != null) authInfo.setText("auth: " + a.username + " (best=" + a.bestScore + ")");
+                boolean authed = a != null;
+
+                // prevent "multi-login" from UI
+                login.setDisable(!isConnected() || authed);
+                register.setDisable(!isConnected() || authed);
+
+                if (authed) authInfo.setText("auth: " + a.username + " (best=" + a.bestScore + ")");
 
                 String lastErr = client.lastError.get();
                 if (lastErr != null) err.setText(lastErr);
 
                 Messages.State st = client.latestState.get();
-                render(g, st, a == null ? null : a.playerId);
+                render(g, st, authed ? a.playerId : null);
 
                 if (st != null && st.leaderboard != null) {
                     lbList.getItems().setAll(formatLeaderboard(st.leaderboard));
                 }
+            }
+
+            private boolean isConnected() {
+                return client != null && (client.status.get() != null) && client.status.get().startsWith("connected");
             }
         }.start();
 
@@ -139,6 +199,9 @@ public final class ClientMain extends Application {
             }
             Platform.exit();
         });
+
+        // focus canvas by default
+        Platform.runLater(canvas::requestFocus);
 
         return scene;
     }
@@ -191,6 +254,7 @@ public final class ClientMain extends Application {
             for (Messages.Player p : st.players) idxToColor.put(p.idx, parseHex(p.color, Color.CORNFLOWERBLUE));
         }
 
+        // territories
         if (st.owners != null) {
             int w = st.gridW, h = st.gridH, cell = st.cellSize;
             for (int y = 0; y < h; y++) {
@@ -204,6 +268,7 @@ public final class ClientMain extends Application {
             }
         }
 
+        // trails (semi-transparent)
         if (st.players != null) {
             for (Messages.Player p : st.players) {
                 if (p.trail == null) continue;
@@ -213,6 +278,7 @@ public final class ClientMain extends Application {
             }
         }
 
+        // players
         if (st.players != null) {
             for (Messages.Player p : st.players) {
                 Color base = parseHex(p.color, Color.CORNFLOWERBLUE);
@@ -234,6 +300,7 @@ public final class ClientMain extends Application {
             }
         }
 
+        // match scoreboard
         g.setFill(Color.rgb(255, 255, 255, 0.9));
         g.fillText("Match scoreboard:", 12, 18);
         double y = 38;
