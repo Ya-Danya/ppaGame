@@ -11,11 +11,7 @@ public final class Net {
             .registerModule(new JavaTimeModule())
             .configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false);
 
-    public static JsonNode parse(String line) throws JsonProcessingException {
-        return MAPPER.readTree(line);
-    }
+    public static JsonNode parse(String line) throws JsonProcessingException { return MAPPER.readTree(line); }
 
-    public static String toJson(Object o) throws JsonProcessingException {
-        return MAPPER.writeValueAsString(o);
-    }
+    public static String toJson(Object o) throws JsonProcessingException { return MAPPER.writeValueAsString(o); }
 }

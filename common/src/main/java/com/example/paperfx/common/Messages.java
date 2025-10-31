@@ -19,6 +19,17 @@ public final class Messages {
         public LeaderEntry() {}
     }
 
+    public static final class RoomJoined {
+        public final String type = "room_joined";
+        public String roomId;
+        public int capacity;
+        public int players;
+        public RoomJoined(String roomId, int capacity, int players) {
+            this.roomId = roomId; this.capacity = capacity; this.players = players;
+        }
+        public RoomJoined() {}
+    }
+
     // client -> server
     public static final class Register {
         public final String type = "register";
@@ -51,6 +62,25 @@ public final class Messages {
         public LeaderboardReq() {}
     }
 
+    public static final class CreateRoom {
+        public final String type = "create_room";
+        public CreateRoom() {}
+    }
+
+    public static final class JoinRoom {
+        public final String type = "join_room";
+        public String roomId;
+        public JoinRoom(String roomId) { this.roomId = roomId; }
+        public JoinRoom() {}
+    }
+
+    public static final class Ping {
+        public final String type = "ping";
+        public long t;
+        public Ping(long t) { this.t = t; }
+        public Ping() {}
+    }
+
     // server -> client
     public static final class Error {
         public final String type = "error";
@@ -63,17 +93,11 @@ public final class Messages {
         public final String type = "auth_ok";
         public String userId;
         public String username;
-        public String playerId;
-        public int idx;
-        public String color;
         public int bestScore;
 
-        public AuthOk(String userId, String username, String playerId, int idx, String color, int bestScore) {
+        public AuthOk(String userId, String username, int bestScore) {
             this.userId = userId;
             this.username = username;
-            this.playerId = playerId;
-            this.idx = idx;
-            this.color = color;
             this.bestScore = bestScore;
         }
         public AuthOk() {}
@@ -105,6 +129,7 @@ public final class Messages {
     public static final class State {
         public final String type = "state";
         public long tick;
+        public String roomId;
         public int cellSize;
         public int gridW;
         public int gridH;
@@ -112,8 +137,9 @@ public final class Messages {
         public List<Player> players;
         public List<LeaderEntry> leaderboard;
 
-        public State(long tick, int cellSize, int gridW, int gridH, int[] owners, List<Player> players, List<LeaderEntry> leaderboard) {
+        public State(long tick, String roomId, int cellSize, int gridW, int gridH, int[] owners, List<Player> players, List<LeaderEntry> leaderboard) {
             this.tick = tick;
+            this.roomId = roomId;
             this.cellSize = cellSize;
             this.gridW = gridW;
             this.gridH = gridH;
