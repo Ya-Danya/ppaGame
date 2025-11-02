@@ -4,473 +4,273 @@ import com.example.paperfx.common.Messages;
 import com.example.paperfx.common.Net;
 import com.fasterxml.jackson.databind.JsonNode;
 
-import java.io.*;
-import java.net.*;
+import java.io.IOException;
+import java.net.ServerSocket;
+import java.net.Socket;
 import java.sql.SQLException;
+import java.time.Instant;
 import java.util.*;
 import java.util.concurrent.*;
-import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicLong;
 
 public final class ServerMain {
-
-    private static final int CELL = 10;
-    private static final int GRID_W = 80;
-    private static final int GRID_H = 60;
-
-    private static final double PLAYER_SIZE = 16;
-    private static final double PLAYER_SPEED = 240;
-
-    private static final int SPAWN_R = 3;
-
-    private static final int LEADERBOARD_LIMIT = 10;
-    private static final long LEADERBOARD_REFRESH_MS = 2000;
-
-    private final int port;
-    private final ServerSocket serverSocket;
-
-    private final CopyOnWriteArrayList<ClientConn> clients = new CopyOnWriteArrayList<>();
-    private final ConcurrentHashMap<String, PlayerEntity> players = new ConcurrentHashMap<>();
-
-    private final int[] owners = new int[GRID_W * GRID_H];
-
-    private final Random rnd = new Random();
-    private final AtomicLong tick = new AtomicLong(0);
-    private final AtomicInteger nextIdx = new AtomicInteger(1);
+    private static final int PORT = 7777;
 
     private final Db db;
-    private volatile List<Messages.LeaderEntry> cachedLeaderboard = List.of();
-    private volatile long lastLbMs = 0;
+    private final RoomManager roomManager;
 
-    public static void main(String[] args) throws Exception {
-        int port = args.length >= 1 ? Integer.parseInt(args[0]) : 7777;
+    private final ExecutorService clientPool = Executors.newCachedThreadPool(r -> {
+        Thread t = new Thread(r, "client");
+        t.setDaemon(true);
+        return t;
+    });
 
-        String dbUrl = envOr("DB_URL", "jdbc:postgresql://localhost:5432/paperfx");
-        String dbUser = envOr("DB_USER", "paperfx");
-        String dbPass = envOr("DB_PASS", "paperfx");
+    private final ScheduledExecutorService tick = Executors.newSingleThreadScheduledExecutor(r -> {
+        Thread t = new Thread(r, "tick");
+        t.setDaemon(true);
+        return t;
+    });
 
-        ServerMain s = new ServerMain(port, new Db(dbUrl, dbUser, dbPass));
-        s.start();
-    }
+    // active sessions by username (enforces 1 session per username)
+    private final ConcurrentHashMap<String, ClientConn> activeByUsername = new ConcurrentHashMap<>();
 
-    public ServerMain(int port, Db db) throws IOException, SQLException {
-        this.port = port;
-        this.db = db;
+    public ServerMain() throws SQLException {
+        String url = env("DB_URL", "jdbc:postgresql://127.0.0.1:5433/paperfx");
+        String user = env("DB_USER", "paperfx");
+        String pass = env("DB_PASS", "paperfx");
+
+        this.db = new Db(url, user, pass);
         this.db.init();
 
-        this.serverSocket = new ServerSocket();
-        this.serverSocket.bind(new InetSocketAddress("0.0.0.0", port));
-    }
+        this.roomManager = new RoomManager(4, 80, 60, 10);
 
-    public void start() {
-        System.out.println("[server] listening on 0.0.0.0:" + port);
-
-        Thread acceptor = new Thread(this::acceptLoop, "acceptor");
-        acceptor.setDaemon(true);
-        acceptor.start();
-
-        ScheduledExecutorService loop = Executors.newSingleThreadScheduledExecutor(r -> {
-            Thread t = new Thread(r, "game-loop");
-            t.setDaemon(true);
-            return t;
-        });
-
-        final long periodMs = 50;
-        final long[] lastNs = { System.nanoTime() };
-
-        loop.scheduleAtFixedRate(() -> {
-            long now = System.nanoTime();
-            double dt = (now - lastNs[0]) / 1_000_000_000.0;
-            lastNs[0] = now;
-
-            step(dt);
-            refreshLeaderboardIfNeeded();
-            broadcastState();
-        }, 0, periodMs, TimeUnit.MILLISECONDS);
-
-        try { while (true) Thread.sleep(10_000); } catch (InterruptedException ignored) {}
-    }
-
-    private void refreshLeaderboardIfNeeded() {
-        long now = System.currentTimeMillis();
-        if (now - lastLbMs < LEADERBOARD_REFRESH_MS) return;
-        lastLbMs = now;
-        try { cachedLeaderboard = db.topBest(LEADERBOARD_LIMIT); }
-        catch (SQLException e) { System.err.println("[server] leaderboard error: " + e.getMessage()); }
-    }
-
-    private void acceptLoop() {
-        while (true) {
+        // game loop for all rooms
+        tick.scheduleAtFixedRate(() -> {
             try {
-                Socket s = serverSocket.accept();
-                s.setTcpNoDelay(true);
-                s.setSoTimeout(30_000);
-                ClientConn conn = new ClientConn(s);
-                clients.add(conn);
-                conn.start();
-                System.out.println("[server] client connected: " + s.getRemoteSocketAddress());
-            } catch (IOException e) {
-                System.err.println("[server] accept error: " + e.getMessage());
-            }
-        }
-    }
-
-    private void step(double dt) {
-        for (PlayerEntity p : players.values()) {
-            if (p.deadCooldownTicks > 0) {
-                p.deadCooldownTicks--;
-                continue;
-            }
-
-            int oldCx = p.cellX;
-            int oldCy = p.cellY;
-
-            p.x = clamp(p.x + (p.inputDx * PLAYER_SPEED) * dt, 0, GRID_W * (double) CELL - PLAYER_SIZE);
-            p.y = clamp(p.y + (p.inputDy * PLAYER_SPEED) * dt, 0, GRID_H * (double) CELL - PLAYER_SIZE);
-
-            int newCx = clampInt((int) Math.floor((p.x + PLAYER_SIZE / 2.0) / CELL), 0, GRID_W - 1);
-            int newCy = clampInt((int) Math.floor((p.y + PLAYER_SIZE / 2.0) / CELL), 0, GRID_H - 1);
-
-            if (newCx != oldCx || newCy != oldCy) {
-                for (int[] c : bresenham(oldCx, oldCy, newCx, newCy)) {
-                    if (c[0] == oldCx && c[1] == oldCy) continue;
-                    p.cellX = c[0];
-                    p.cellY = c[1];
-                    onEnterCell(p, c[0], c[1]);
+                for (Room room : roomManager.allRooms()) {
+                    room.step();
+                    broadcastRoomState(room);
                 }
-            }
-
-            p.score = countTerritoryCells(p.idx);
-        }
-        tick.incrementAndGet();
+            } catch (Exception ignored) {}
+        }, 50, 50, TimeUnit.MILLISECONDS);
     }
 
-    private int countTerritoryCells(int idx) {
-        int n = 0;
-        for (int o : owners) if (o == idx) n++;
-        return n;
+    public static void main(String[] args) throws Exception {
+        new ServerMain().run();
     }
 
-    private void onEnterCell(PlayerEntity mover, int x, int y) {
-        for (PlayerEntity other : players.values()) {
-            if (other.idx == mover.idx) continue;
-            if (other.deadCooldownTicks > 0) continue;
-            if (other.trailSet.contains(key(x, y))) {
-                killAndRespawn(other, "trail intersected by " + mover.username);
+    public void run() throws IOException {
+        try (ServerSocket ss = new ServerSocket(PORT)) {
+            System.out.println("PaperFX server listening on " + PORT);
+            while (true) {
+                Socket s = ss.accept();
+                ClientConn c = new ClientConn(s, this);
+                clientPool.submit(c);
             }
         }
-
-        int idx = mover.idx;
-        boolean inOwnTerritory = owners[toIndex(x, y)] == idx;
-        boolean inOwnTrailBefore = mover.trailSet.contains(key(x, y));
-
-        if (!inOwnTerritory) {
-            addTrailCell(mover, x, y);
-            if (inOwnTrailBefore && mover.trailList.size() >= 4) captureLoopGlobal(mover);
-        } else {
-            if (!mover.trailList.isEmpty()) captureLoopGlobal(mover);
-        }
     }
 
-    private void addTrailCell(PlayerEntity p, int x, int y) {
-        long k = key(x, y);
-        if (p.trailSet.add(k)) p.trailList.add(new Messages.Cell(x, y));
-    }
-
-    private void killAndRespawn(PlayerEntity victim, String reason) {
-        int idx = victim.idx;
-        try { db.recordResult(victim.userId, victim.score); }
-        catch (SQLException e) { System.err.println("[server] recordResult error: " + e.getMessage()); }
-
-        for (int i = 0; i < owners.length; i++) if (owners[i] == idx) owners[i] = 0;
-        victim.clearTrail();
-
-        int sx = rnd.nextInt(GRID_W);
-        int sy = rnd.nextInt(GRID_H);
-        victim.x = sx * CELL + (CELL - PLAYER_SIZE) / 2.0;
-        victim.y = sy * CELL + (CELL - PLAYER_SIZE) / 2.0;
-        victim.cellX = sx;
-        victim.cellY = sy;
-        giveInitialTerritory(idx, sx, sy);
-
-        victim.deadCooldownTicks = 10;
-        System.out.println("[server] " + victim.username + " died: " + reason);
-    }
-
-    private void captureLoopGlobal(PlayerEntity p) {
-        int idx = p.idx;
-        if (p.trailList.size() < 2) { p.clearTrail(); return; }
-
-        boolean[] blocked = new boolean[owners.length];
-        for (int i = 0; i < owners.length; i++) if (owners[i] == idx) blocked[i] = true;
-        for (Messages.Cell c : p.trailList) blocked[toIndex(c.x, c.y)] = true;
-
-        boolean[] outside = new boolean[owners.length];
-        ArrayDeque<Integer> q = new ArrayDeque<>();
-
-        for (int x = 0; x < GRID_W; x++) {
-            pushIfOpen(q, outside, blocked, toIndex(x, 0));
-            pushIfOpen(q, outside, blocked, toIndex(x, GRID_H - 1));
-        }
-        for (int y = 0; y < GRID_H; y++) {
-            pushIfOpen(q, outside, blocked, toIndex(0, y));
-            pushIfOpen(q, outside, blocked, toIndex(GRID_W - 1, y));
-        }
-
-        while (!q.isEmpty()) {
-            int cur = q.removeFirst();
-            int cx = cur % GRID_W;
-            int cy = cur / GRID_W;
-
-            if (cx > 0) pushIfOpen(q, outside, blocked, cur - 1);
-            if (cx + 1 < GRID_W) pushIfOpen(q, outside, blocked, cur + 1);
-            if (cy > 0) pushIfOpen(q, outside, blocked, cur - GRID_W);
-            if (cy + 1 < GRID_H) pushIfOpen(q, outside, blocked, cur + GRID_W);
-        }
-
-        for (int i = 0; i < owners.length; i++) {
-            if (blocked[i] || outside[i]) continue;
-            if (owners[i] == 0) owners[i] = idx;
-        }
-        for (Messages.Cell c : p.trailList) {
-            int i = toIndex(c.x, c.y);
-            if (owners[i] == 0) owners[i] = idx;
-        }
-
-        p.clearTrail();
-    }
-
-    private static void pushIfOpen(ArrayDeque<Integer> q, boolean[] outside, boolean[] blocked, int i) {
-        if (blocked[i] || outside[i]) return;
-        outside[i] = true;
-        q.addLast(i);
-    }
-
-    private void broadcastState() {
-        int[] ownersSnap = Arrays.copyOf(owners, owners.length);
-
-        List<Messages.Player> ps = new ArrayList<>();
-        for (PlayerEntity p : players.values()) {
-            List<Messages.Cell> trail = p.trailList.isEmpty() ? null : new ArrayList<>(p.trailList);
-            ps.add(new Messages.Player(p.playerId, p.idx, p.username, p.x, p.y, p.score, p.color, trail));
-        }
-        ps.sort(Comparator.comparingInt((Messages.Player pp) -> pp.score).reversed());
-
-        Messages.State msg = new Messages.State(tick.get(), CELL, GRID_W, GRID_H, ownersSnap, ps, cachedLeaderboard);
-
+    void onMessage(ClientConn c, String type, JsonNode n) {
         try {
-            String line = Net.toJson(msg);
-            for (ClientConn c : clients) c.send(line);
+            switch (type) {
+                case "ping" -> { /* keepalive */ }
+                case "register" -> handleRegister(c, n);
+                case "login" -> handleLogin(c, n);
+                case "leaderboard_req" -> handleLeaderboard(c, n);
+                case "create_room" -> handleCreateRoom(c);
+                case "join_room" -> handleJoinRoom(c, n);
+                case "input" -> handleInput(c, n);
+                default -> c.send(new Messages.Error("unknown message type: " + type));
+            }
         } catch (Exception e) {
-            System.err.println("[server] json encode error: " + e.getMessage());
+            c.send(new Messages.Error("server error: " + e.getMessage()));
         }
     }
 
-    private static double clamp(double v, double lo, double hi) { return Math.max(lo, Math.min(hi, v)); }
-    private static int clampInt(int v, int lo, int hi) { return Math.max(lo, Math.min(hi, v)); }
-    private int toIndex(int x, int y) { return y * GRID_W + x; }
-    private static long key(int x, int y) { return (((long) x) << 32) ^ (y & 0xffffffffL); }
-
-    private void giveInitialTerritory(int idx, int cx, int cy) {
-        for (int y = cy - SPAWN_R; y <= cy + SPAWN_R; y++) {
-            for (int x = cx - SPAWN_R; x <= cx + SPAWN_R; x++) {
-                if (x < 0 || y < 0 || x >= GRID_W || y >= GRID_H) continue;
-                owners[toIndex(x, y)] = idx;
-            }
+    private void handleRegister(ClientConn c, JsonNode n) throws SQLException {
+        if (c.isAuthed()) {
+            c.send(new Messages.Error("already authenticated"));
+            return;
         }
+        String u = n.path("username").asText("");
+        String p = n.path("password").asText("");
+        Db.RegisterResult r = db.register(u, p);
+        if (!r.ok()) {
+            c.send(new Messages.Error(r.error()));
+            return;
+        }
+        // auto-login after register
+        finishAuth(c, r.userId(), r.username(), r.bestScore());
     }
 
-    private static List<int[]> bresenham(int x0, int y0, int x1, int y1) {
-        ArrayList<int[]> out = new ArrayList<>();
-        int dx = Math.abs(x1 - x0);
-        int sx = x0 < x1 ? 1 : -1;
-        int dy = -Math.abs(y1 - y0);
-        int sy = y0 < y1 ? 1 : -1;
-        int err = dx + dy;
-
-        int x = x0, y = y0;
-        while (true) {
-            out.add(new int[]{x, y});
-            if (x == x1 && y == y1) break;
-            int e2 = 2 * err;
-            if (e2 >= dy) { err += dy; x += sx; }
-            if (e2 <= dx) { err += dx; y += sy; }
+    private void handleLogin(ClientConn c, JsonNode n) throws SQLException {
+        if (c.isAuthed()) {
+            c.send(new Messages.Error("already authenticated"));
+            return;
         }
-        return out;
+        String u = n.path("username").asText("");
+        String p = n.path("password").asText("");
+        Db.LoginResult r = db.login(u, p);
+        if (!r.ok()) {
+            c.send(new Messages.Error(r.error()));
+            return;
+        }
+        finishAuth(c, r.userId(), r.username(), r.bestScore());
     }
 
-    private static String envOr(String k, String def) {
-        String v = System.getenv(k);
-        return (v == null || v.isBlank()) ? def : v.trim();
+    private void finishAuth(ClientConn c, String userId, String username, int bestScore) {
+        c.userId = userId;
+        c.username = username;
+        c.authed = true;
+
+        // enforce 1 active session per username: kick previous
+        ClientConn prev = activeByUsername.put(username, c);
+        if (prev != null && prev != c) {
+            prev.send(new Messages.Error("logged in elsewhere"));
+            prev.close();
+        }
+
+        c.send(new Messages.AuthOk(userId, username, bestScore));
+        // by default, user is not in a room yet; client should join MAIN or create.
     }
 
-    private final class ClientConn {
-        private final Socket socket;
-        private final BufferedReader in;
-        private final PrintWriter out;
+    private void handleLeaderboard(ClientConn c, JsonNode n) throws SQLException {
+        int limit = n.path("limit").asInt(10);
+        List<Messages.LeaderEntry> top = db.topBest(limit);
+        // send as state leaderboard-only (client merges)
+        c.send(new Messages.State(0, c.roomId, 10, 0, 0, null, List.of(), top));
+    }
 
-        private volatile boolean authed = false;
-        private volatile String userId;
-        private volatile String username;
-        private volatile String playerId;
+    private void handleCreateRoom(ClientConn c) {
+        if (!c.isAuthed()) { c.send(new Messages.Error("not authenticated")); return; }
+        Room r = roomManager.create();
+        joinRoomInternal(c, r.roomId);
+    }
 
-        ClientConn(Socket socket) throws IOException {
-            this.socket = socket;
-            this.in = new BufferedReader(new InputStreamReader(socket.getInputStream(), "UTF-8"));
-            this.out = new PrintWriter(new OutputStreamWriter(socket.getOutputStream(), "UTF-8"), true);
+    private void handleJoinRoom(ClientConn c, JsonNode n) {
+        if (!c.isAuthed()) { c.send(new Messages.Error("not authenticated")); return; }
+        String rid = n.path("roomId").asText("").trim().toUpperCase(Locale.ROOT);
+        if (rid.isEmpty()) { c.send(new Messages.Error("roomId is empty")); return; }
+        Room r = roomManager.get(rid);
+        if (r == null) {
+            c.send(new Messages.Error("room not found"));
+            return;
+        }
+        joinRoomInternal(c, rid);
+    }
+
+    private void joinRoomInternal(ClientConn c, String rid) {
+        // leave previous room if any
+        leaveRoom(c);
+
+        Room r = roomManager.get(rid);
+        if (r == null) {
+            c.send(new Messages.Error("room not found"));
+            return;
+        }
+        if (r.playersCount() >= r.capacity) {
+            c.send(new Messages.Error("room_full"));
+            return;
         }
 
-        void start() {
-            Thread t = new Thread(this::run, "client-" + socket.getPort());
-            t.setDaemon(true);
-            t.start();
+        String playerId = Ids.playerId();
+        String color = pickColor(rid, c.username);
+        PlayerEntity p = new PlayerEntity(playerId, c.userId, c.username, color);
+
+        boolean ok = r.addPlayer(p);
+        if (!ok) {
+            c.send(new Messages.Error("room_full"));
+            return;
         }
 
-        void send(String jsonLine) { try { out.println(jsonLine); } catch (Exception ignored) {} }
+        c.roomId = rid;
+        c.playerId = playerId;
 
-        void run() {
-            try {
-                String line;
-                while ((line = in.readLine()) != null) {
-                    JsonNode o = Net.parse(line);
-                    String type = o.path("type").asText("");
-                    switch (type) {
-                        case "register" -> onRegister(o);
-                        case "login" -> onLogin(o);
-                        case "input" -> onInput(o);
-                        case "leaderboard_req" -> onLeaderboardReq(o);
-                        default -> sendSafe(new Messages.Error("unknown message type: " + type));
+        c.send(new Messages.RoomJoined(rid, r.capacity, r.playersCount()));
+        // Immediately push a state snapshot for smoother join.
+        broadcastRoomState(r);
+    }
+
+    private void leaveRoom(ClientConn c) {
+        if (c.roomId == null || c.playerId == null) return;
+        Room r = roomManager.get(c.roomId);
+        if (r != null) {
+            r.removePlayer(c.playerId);
+        }
+        c.roomId = null;
+        c.playerId = null;
+    }
+
+    private void handleInput(ClientConn c, JsonNode n) {
+        if (c.roomId == null || c.playerId == null) return;
+        int dx = n.path("dx").asInt(0);
+        int dy = n.path("dy").asInt(0);
+
+        Room r = roomManager.get(c.roomId);
+        if (r == null) return;
+        r.setInput(c.playerId, dx, dy);
+    }
+
+    void onDisconnected(ClientConn c) {
+        // If authed, record "last score" at disconnect: current territory size.
+        try {
+            if (c.isAuthed() && c.roomId != null && c.playerId != null) {
+                Room r = roomManager.get(c.roomId);
+                int score = 0;
+                if (r != null) {
+                    // compute quickly by counting owners==idx for this player
+                    PlayerEntity pe = r.players.get(c.playerId);
+                    if (pe != null) {
+                        int idx = pe.idx;
+                        for (int o : r.owners) if (o == idx) score++;
                     }
+                    r.removePlayer(c.playerId);
                 }
-            } catch (SocketTimeoutException e) {
-                System.out.println("[server] client timeout: " + socket.getRemoteSocketAddress());
-            } catch (Exception e) {
-                System.out.println("[server] client error: " + e.getMessage());
-            } finally {
-                cleanup();
+                db.recordResult(c.userId, score);
             }
-        }
-
-        private void onRegister(JsonNode o) {
-            String u = o.path("username").asText("");
-            String p = o.path("password").asText("");
-            try {
-                Db.RegisterResult r = db.register(u, p);
-                if (!r.ok()) { sendSafe(new Messages.Error(r.error())); return; }
-                onLogin(o);
-            } catch (SQLException e) {
-                sendSafe(new Messages.Error("db error: " + e.getMessage()));
+        } catch (Exception ignored) {
+        } finally {
+            if (c.username != null) {
+                activeByUsername.compute(c.username, (k, v) -> v == c ? null : v);
             }
-        }
-
-        private void onLogin(JsonNode o) {
-            String u = o.path("username").asText("");
-            String p = o.path("password").asText("");
-            try {
-                Db.LoginResult r = db.login(u, p);
-                if (!r.ok()) { sendSafe(new Messages.Error(r.error())); return; }
-
-                this.authed = true;
-                this.userId = r.userId();
-                this.username = r.username();
-
-                String pid = UUID.randomUUID().toString();
-                int idx = nextIdx.getAndIncrement();
-                String color = randomColorHex();
-
-                int sx = rnd.nextInt(GRID_W);
-                int sy = rnd.nextInt(GRID_H);
-
-                double px = sx * CELL + (CELL - PLAYER_SIZE) / 2.0;
-                double py = sy * CELL + (CELL - PLAYER_SIZE) / 2.0;
-
-                PlayerEntity pe = new PlayerEntity(userId, username, pid, idx, color, px, py, sx, sy);
-                players.put(pid, pe);
-                this.playerId = pid;
-
-                giveInitialTerritory(idx, sx, sy);
-                sendSafe(new Messages.AuthOk(userId, username, pid, idx, color, r.bestScore()));
-                System.out.println("[server] auth ok: " + username + " idx=" + idx);
-            } catch (SQLException e) {
-                sendSafe(new Messages.Error("db error: " + e.getMessage()));
-            }
-        }
-
-        private void onInput(JsonNode o) {
-            if (!authed || playerId == null) { sendSafe(new Messages.Error("not authenticated")); return; }
-            int dx = clampDir(o.path("dx").asInt(0));
-            int dy = clampDir(o.path("dy").asInt(0));
-            PlayerEntity p = players.get(playerId);
-            if (p != null) { p.inputDx = dx; p.inputDy = dy; }
-        }
-
-        private void onLeaderboardReq(JsonNode o) {
-            int limit = Math.max(1, Math.min(o.path("limit").asInt(10), 50));
-            try { cachedLeaderboard = db.topBest(limit); }
-            catch (SQLException e) { sendSafe(new Messages.Error("db error: " + e.getMessage())); }
-        }
-
-        private void cleanup() {
-            clients.remove(this);
-            if (playerId != null) {
-                PlayerEntity p = players.remove(playerId);
-                if (p != null) {
-                    try { db.recordResult(p.userId, p.score); }
-                    catch (SQLException e) { System.err.println("[server] recordResult(disconnect) error: " + e.getMessage()); }
-                }
-            }
-            try { socket.close(); } catch (IOException ignored) {}
-            System.out.println("[server] client disconnected: " + socket.getRemoteSocketAddress());
-        }
-
-        private void sendSafe(Object msg) {
-            try { send(Net.toJson(msg)); } catch (Exception ignored) {}
-        }
-
-        private int clampDir(int v) { return v < 0 ? -1 : (v > 0 ? 1 : 0); }
-
-        private String randomColorHex() {
-            int r = 80 + rnd.nextInt(176);
-            int g = 80 + rnd.nextInt(176);
-            int b = 80 + rnd.nextInt(176);
-            return String.format("#%02X%02X%02X", r, g, b);
         }
     }
 
-    private static final class PlayerEntity {
-        final String userId;
-        final String username;
-
-        final String playerId;
-        final int idx;
-        final String color;
-
-        volatile double x, y;
-        volatile int inputDx = 0, inputDy = 0;
-
-        volatile int score = 0;
-
-        volatile int cellX;
-        volatile int cellY;
-
-        volatile int deadCooldownTicks = 0;
-
-        final HashSet<Long> trailSet = new HashSet<>();
-        final ArrayList<Messages.Cell> trailList = new ArrayList<>();
-
-        PlayerEntity(String userId, String username, String playerId, int idx, String color,
-                     double x, double y, int cellX, int cellY) {
-            this.userId = userId;
-            this.username = username;
-            this.playerId = playerId;
-            this.idx = idx;
-            this.color = color;
-            this.x = x;
-            this.y = y;
-            this.cellX = cellX;
-            this.cellY = cellY;
+    private void broadcastRoomState(Room r) {
+        // build state once; send to all clients in that room
+        List<Messages.Player> players = r.snapshotPlayers();
+        // lightweight: only include persistent leaderboard occasionally (every 20 ticks)
+        List<Messages.LeaderEntry> top = List.of();
+        if (r.tick() % 20 == 0) {
+            try { top = db.topBest(10); } catch (SQLException ignored) {}
         }
 
-        void clearTrail() { trailSet.clear(); trailList.clear(); }
+        Messages.State st = new Messages.State(
+                r.tick(),
+                r.roomId,
+                r.cellSize,
+                r.gridW,
+                r.gridH,
+                r.owners,
+                players,
+                top
+        );
+
+        for (ClientConn c : activeByUsername.values()) {
+            if (c == null || c.closed.get()) continue;
+            if (!Objects.equals(c.roomId, r.roomId)) continue;
+            c.send(st);
+        }
+    }
+
+    private static String pickColor(String roomId, String username) {
+        // stable-ish color choice from a small palette
+        String[] palette = {"#3B82F6", "#22C55E", "#EF4444", "#F59E0B", "#A855F7", "#14B8A6"};
+        int h = Math.abs(Objects.hash(roomId, username));
+        return palette[h % palette.length];
+    }
+
+    private static String env(String k, String def) {
+        String v = System.getenv(k);
+        return (v == null || v.isBlank()) ? def : v;
     }
 }

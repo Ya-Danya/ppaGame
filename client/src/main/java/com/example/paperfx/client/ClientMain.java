@@ -1,10 +1,13 @@
 package com.example.paperfx.client;
 
 import com.example.paperfx.common.Messages;
+import com.fasterxml.jackson.databind.JsonNode;
 import javafx.animation.AnimationTimer;
 import javafx.application.Application;
 import javafx.application.Platform;
+import javafx.beans.property.SimpleStringProperty;
 import javafx.geometry.Insets;
+import javafx.geometry.Pos;
 import javafx.scene.Scene;
 import javafx.scene.canvas.Canvas;
 import javafx.scene.canvas.GraphicsContext;
@@ -14,310 +17,402 @@ import javafx.scene.layout.*;
 import javafx.scene.paint.Color;
 import javafx.stage.Stage;
 
-import java.io.IOException;
 import java.util.*;
+import java.util.concurrent.*;
 
 public final class ClientMain extends Application {
+    private static final int PORT = 7777;
 
-    private NetworkClient client;
+    private NetClient net;
+    private volatile boolean authed = false;
+    private volatile boolean inRoom = false;
 
-    private final Set<KeyCode> keysDown = new HashSet<>();
-    private int lastDx = 0;
-    private int lastDy = 0;
+    private final ScheduledExecutorService pingExec = Executors.newSingleThreadScheduledExecutor(r -> {
+        Thread t = new Thread(r, "ping");
+        t.setDaemon(true);
+        return t;
+    });
 
-    private long lastPingNs = 0;
+    private final Object stateLock = new Object();
+    private Messages.State lastState = null;
 
-    @Override
-    public void start(Stage stage) {
-        stage.setTitle("PaperFX v0.6.1 — Auth + PostgreSQL + Leaderboard");
-        Scene scene = buildScene(stage);
-        stage.setScene(scene);
-        stage.setWidth(1180);
-        stage.setHeight(820);
-        stage.show();
-    }
+    private final SimpleStringProperty statusText = new SimpleStringProperty("Not connected");
 
-    private Scene buildScene(Stage stage) {
-        TextField host = new TextField("127.0.0.1");
-        TextField port = new TextField("7777");
+    private int curDx = 0;
+    private int curDy = 0;
 
-        TextField username = new TextField();
-        PasswordField password = new PasswordField();
+    @Override public void start(Stage stage) throws Exception {
+        net = new NetClient("127.0.0.1", PORT);
+        net.setOnMessage((type, node) -> Platform.runLater(() -> onMessage(type, node)));
+        net.setOnClose(() -> Platform.runLater(() -> {
+            statusText.set("Disconnected");
+            authed = false;
+            inRoom = false;
+        }));
 
-        // "show password" UI: PasswordField + TextField bound to same text
-        TextField passwordVisible = new TextField();
-        passwordVisible.textProperty().bindBidirectional(password.textProperty());
+        try {
+            net.connect();
+            statusText.set("Connected to server");
+        } catch (Exception e) {
+            statusText.set("Connect failed: " + e.getMessage());
+        }
 
-        ToggleButton showPass = new ToggleButton("👁");
-        showPass.setFocusTraversable(false);
-        showPass.setTooltip(new Tooltip("Показать/скрыть пароль"));
+        // --- Auth UI ---
+        TextField usernameField = new TextField();
+        usernameField.setPromptText("Username");
+        usernameField.setText("");
 
-        passwordVisible.managedProperty().bind(showPass.selectedProperty());
-        passwordVisible.visibleProperty().bind(showPass.selectedProperty());
+        PasswordField passField = new PasswordField();
+        passField.setPromptText("Password");
+        passField.setText("");
 
-        password.managedProperty().bind(showPass.selectedProperty().not());
-        password.visibleProperty().bind(showPass.selectedProperty().not());
+        TextField passVisible = new TextField();
+        passVisible.setPromptText("Password");
+        passVisible.setManaged(false);
+        passVisible.setVisible(false);
 
-        StackPane passStack = new StackPane(password, passwordVisible);
-        HBox passBox = new HBox(8, passStack, showPass);
-        HBox.setHgrow(passStack, Priority.ALWAYS);
+        // bind text between password and visible field
+        passVisible.textProperty().bindBidirectional(passField.textProperty());
 
-        Label netStatus = new Label("not connected");
-        Label authInfo = new Label("auth: -");
-        Label err = new Label();
-        err.setTextFill(Color.ORANGERED);
-
-        Button connect = new Button("Connect");
-        Button login = new Button("Login");
-        Button register = new Button("Register");
-        Button refreshLb = new Button("Refresh leaderboard");
-
-        connect.setOnAction(e -> {
-            err.setText("");
-            connect.setDisable(true);
-            try {
-                client = new NetworkClient(host.getText().trim(), Integer.parseInt(port.getText().trim()));
-                netStatus.setText("connected");
-            } catch (Exception ex) {
-                err.setText("connect failed: " + ex.getMessage());
-                connect.setDisable(false);
-            }
+        Button showBtn = new Button("👁");
+        showBtn.setFocusTraversable(false);
+        showBtn.setOnAction(e -> {
+            boolean showing = passVisible.isVisible();
+            passVisible.setVisible(!showing);
+            passVisible.setManaged(!showing);
+            passField.setVisible(showing);
+            passField.setManaged(showing);
         });
 
-        login.setDefaultButton(true);
-        login.setOnAction(e -> {
-            err.setText("");
-            if (client == null) { err.setText("connect first"); return; }
-            if (client.auth.get() != null) return; // already logged in
-            client.send(new Messages.Login(username.getText().trim(), password.getText()));
-        });
+        HBox passRow = new HBox(6, new StackPane(passField, passVisible), showBtn);
+        passRow.setAlignment(Pos.CENTER_LEFT);
+        HBox.setHgrow(passRow.getChildren().get(0), Priority.ALWAYS);
 
-        register.setOnAction(e -> {
-            err.setText("");
-            if (client == null) { err.setText("connect first"); return; }
-            if (client.auth.get() != null) return; // already logged in
-            client.send(new Messages.Register(username.getText().trim(), password.getText()));
-        });
+        Button loginBtn = new Button("Login");
+        Button regBtn = new Button("Register");
+        loginBtn.setMaxWidth(Double.MAX_VALUE);
+        regBtn.setMaxWidth(Double.MAX_VALUE);
 
-        refreshLb.setOnAction(e -> {
-            if (client == null) return;
-            client.send(new Messages.LeaderboardReq(10));
-        });
+        Label status = new Label();
+        status.textProperty().bind(statusText);
 
-        GridPane form = new GridPane();
-        form.setHgap(10);
-        form.setVgap(10);
+        VBox authBox = new VBox(8, new Label("Account"), usernameField, passRow, loginBtn, regBtn, status);
+        authBox.setPadding(new Insets(10));
+        authBox.setPrefWidth(260);
 
-        form.addRow(0, new Label("Host:"), host, connect, netStatus);
-        form.addRow(1, new Label("Port:"), port);
-        form.addRow(2, new Label("Username:"), username);
-        form.addRow(3, new Label("Password:"), passBox);
-        form.addRow(4, login, register);
-        form.addRow(5, refreshLb);
+        // --- Room UI ---
+        TextField roomIdField = new TextField();
+        roomIdField.setPromptText("Room ID (e.g. MAIN)");
+        roomIdField.setDisable(true);
 
-        ListView<String> lbList = new ListView<>();
-        lbList.setPrefHeight(240);
+        Button createRoomBtn = new Button("Create room");
+        Button joinRoomBtn = new Button("Join room");
+        createRoomBtn.setMaxWidth(Double.MAX_VALUE);
+        joinRoomBtn.setMaxWidth(Double.MAX_VALUE);
+        createRoomBtn.setDisable(true);
+        joinRoomBtn.setDisable(true);
 
+        Label roomInfo = new Label("Room: -");
+
+        VBox roomBox = new VBox(8, new Label("Rooms"), roomInfo, roomIdField, createRoomBtn, joinRoomBtn);
+        roomBox.setPadding(new Insets(10));
+
+        // --- Leaderboard ---
+        ListView<String> leaderboard = new ListView<>();
+        leaderboard.setPrefHeight(180);
+
+        VBox left = new VBox(10, authBox, roomBox, new Label("Leaderboard (best score)"), leaderboard);
+        left.setPadding(new Insets(6));
+        left.setPrefWidth(280);
+
+        // --- Canvas ---
         Canvas canvas = new Canvas(800, 600);
-        canvas.setFocusTraversable(true);
-        canvas.setOnMouseClicked(e -> canvas.requestFocus());
         GraphicsContext g = canvas.getGraphicsContext2D();
+        canvas.setFocusTraversable(true);
 
         BorderPane root = new BorderPane();
-        VBox left = new VBox(12,
-                new Label("Login / Register"),
-                form,
-                authInfo,
-                err,
-                new Label("Leaderboard (best):"),
-                lbList
-        );
-        left.setPadding(new Insets(12));
-        left.setPrefWidth(360);
-
         root.setLeft(left);
         root.setCenter(new StackPane(canvas));
 
-        Scene scene = new Scene(root);
+        Scene scene = new Scene(root, 1100, 700);
+        stage.setTitle("PaperFX (Rooms)");
+        stage.setScene(scene);
+        stage.show();
 
-        scene.setOnKeyPressed(e -> { keysDown.add(e.getCode()); updateInput(); });
-        scene.setOnKeyReleased(e -> { keysDown.remove(e.getCode()); updateInput(); });
+        // input handlers
+        scene.setOnKeyPressed(e -> {
+            if (!inRoom) return;
+            KeyCode k = e.getCode();
+            if (k == KeyCode.W || k == KeyCode.UP) { curDx = 0; curDy = -1; sendInput(); }
+            else if (k == KeyCode.S || k == KeyCode.DOWN) { curDx = 0; curDy = 1; sendInput(); }
+            else if (k == KeyCode.A || k == KeyCode.LEFT) { curDx = -1; curDy = 0; sendInput(); }
+            else if (k == KeyCode.D || k == KeyCode.RIGHT) { curDx = 1; curDy = 0; sendInput(); }
+        });
 
-        // when app loses focus, stop movement to avoid "stuck keys"
-        stage.focusedProperty().addListener((obs, was, focused) -> {
-            if (!focused) {
-                keysDown.clear();
-                lastDx = 0;
-                lastDy = 0;
-                if (client != null && client.auth.get() != null) client.send(new Messages.Input(0, 0));
+        // focus/idle: reset input on focus loss
+        stage.focusedProperty().addListener((obs, oldV, newV) -> {
+            if (!newV) {
+                curDx = 0; curDy = 0;
+                sendInput();
             } else {
-                Platform.runLater(canvas::requestFocus);
+                canvas.requestFocus();
             }
         });
 
+        // auth actions (prevent multi-click)
+        loginBtn.setOnAction(e -> {
+            if (authed) return;
+            loginBtn.setDisable(true);
+            regBtn.setDisable(true);
+            net.send(new Messages.Login(usernameField.getText(), passField.getText()));
+        });
+        regBtn.setOnAction(e -> {
+            if (authed) return;
+            loginBtn.setDisable(true);
+            regBtn.setDisable(true);
+            net.send(new Messages.Register(usernameField.getText(), passField.getText()));
+        });
+
+        createRoomBtn.setOnAction(e -> net.send(new Messages.CreateRoom()));
+        joinRoomBtn.setOnAction(e -> net.send(new Messages.JoinRoom(roomIdField.getText().trim())));
+
+        // ping keepalive
+        pingExec.scheduleAtFixedRate(() -> {
+            if (net != null) net.send(new Messages.Ping(System.currentTimeMillis()));
+        }, 2, 5, TimeUnit.SECONDS);
+
+        // render loop
         new AnimationTimer() {
             @Override public void handle(long now) {
-                if (client == null) {
-                    renderNoState(g, "connect to server");
+                Messages.State s;
+                synchronized (stateLock) { s = lastState; }
+                if (s == null || s.owners == null) {
+                    g.setFill(Color.BLACK);
+                    g.fillRect(0, 0, canvas.getWidth(), canvas.getHeight());
                     return;
                 }
-
-                // periodic keepalive to keep server connection "warm"
-                if (now - lastPingNs > 5_000_000_000L) {
-                    lastPingNs = now;
-                    client.send(new Messages.Ping());
-                }
-
-                Messages.AuthOk a = client.auth.get();
-                boolean authed = a != null;
-
-                // prevent "multi-login" from UI
-                login.setDisable(!isConnected() || authed);
-                register.setDisable(!isConnected() || authed);
-
-                if (authed) authInfo.setText("auth: " + a.username + " (best=" + a.bestScore + ")");
-
-                String lastErr = client.lastError.get();
-                if (lastErr != null) err.setText(lastErr);
-
-                Messages.State st = client.latestState.get();
-                render(g, st, authed ? a.playerId : null);
-
-                if (st != null && st.leaderboard != null) {
-                    lbList.getItems().setAll(formatLeaderboard(st.leaderboard));
-                }
-            }
-
-            private boolean isConnected() {
-                return client != null && (client.status.get() != null) && client.status.get().startsWith("connected");
+                render(g, canvas, s);
             }
         }.start();
 
-        stage.setOnCloseRequest(e -> {
-            if (client != null) {
-                try { client.close(); } catch (IOException ignored) {}
-            }
-            Platform.exit();
-        });
-
-        // focus canvas by default
+        // initial focus
         Platform.runLater(canvas::requestFocus);
-
-        return scene;
     }
 
-    private List<String> formatLeaderboard(List<Messages.LeaderEntry> entries) {
-        List<String> out = new ArrayList<>();
-        int i = 1;
-        for (Messages.LeaderEntry e : entries) {
-            out.add(i + ". " + e.username + " — " + e.bestScore);
-            i++;
-        }
-        return out;
+    private void sendInput() {
+        if (net == null) return;
+        if (!inRoom) return;
+        net.send(new Messages.Input(curDx, curDy));
     }
 
-    private void updateInput() {
-        if (client == null) return;
-        if (client.auth.get() == null) return;
+    private void onMessage(String type, JsonNode n) {
+        switch (type) {
+            case "auth_ok" -> {
+                authed = true;
+                statusText.set("Authenticated as " + n.path("username").asText());
+                // enable room controls
+                // (we can't access UI controls directly here; we use status + infer from scene graph)
+                enableRoomControls(true);
+                // auto-join MAIN for convenience
+                net.send(new Messages.JoinRoom("MAIN"));
+            }
+            case "room_joined" -> {
+                inRoom = true;
+                String roomId = n.path("roomId").asText("-");
+                int cap = n.path("capacity").asInt(4);
+                int players = n.path("players").asInt(0);
+                statusText.set("Joined room " + roomId + " (" + players + "/" + cap + ")");
+                updateRoomInfo(roomId, players, cap);
+            }
+            case "state" -> {
+                Messages.State s = new Messages.State();
+                s.tick = n.path("tick").asLong(0);
+                s.roomId = n.path("roomId").asText(null);
+                s.cellSize = n.path("cellSize").asInt(10);
+                s.gridW = n.path("gridW").asInt(0);
+                s.gridH = n.path("gridH").asInt(0);
 
-        int dx = 0, dy = 0;
-        if (keysDown.contains(KeyCode.LEFT) || keysDown.contains(KeyCode.A)) dx -= 1;
-        if (keysDown.contains(KeyCode.RIGHT) || keysDown.contains(KeyCode.D)) dx += 1;
-        if (keysDown.contains(KeyCode.UP) || keysDown.contains(KeyCode.W)) dy -= 1;
-        if (keysDown.contains(KeyCode.DOWN) || keysDown.contains(KeyCode.S)) dy += 1;
+                // owners array
+                if (n.hasNonNull("owners")) {
+                    int len = n.get("owners").size();
+                    int[] owners = new int[len];
+                    for (int i = 0; i < len; i++) owners[i] = n.get("owners").get(i).asInt(0);
+                    s.owners = owners;
+                }
 
-        if (dx != lastDx || dy != lastDy) {
-            lastDx = dx; lastDy = dy;
-            client.send(new Messages.Input(dx, dy));
+                // players
+                if (n.hasNonNull("players")) {
+                    List<Messages.Player> ps = new ArrayList<>();
+                    for (JsonNode pj : n.get("players")) {
+                        Messages.Player p = new Messages.Player();
+                        p.playerId = pj.path("playerId").asText();
+                        p.idx = pj.path("idx").asInt();
+                        p.username = pj.path("username").asText();
+                        p.x = pj.path("x").asDouble();
+                        p.y = pj.path("y").asDouble();
+                        p.score = pj.path("score").asInt();
+                        p.color = pj.path("color").asText("#ffffff");
+                        // trail
+                        List<Messages.Cell> trail = new ArrayList<>();
+                        if (pj.hasNonNull("trail")) {
+                            for (JsonNode cj : pj.get("trail")) {
+                                trail.add(new Messages.Cell(cj.path("x").asInt(), cj.path("y").asInt()));
+                            }
+                        }
+                        p.trail = trail;
+                        ps.add(p);
+                    }
+                    s.players = ps;
+                } else {
+                    s.players = List.of();
+                }
+
+                // leaderboard
+                if (n.hasNonNull("leaderboard")) {
+                    List<String> lb = new ArrayList<>();
+                    for (JsonNode ej : n.get("leaderboard")) {
+                        String u = ej.path("username").asText();
+                        int sc = ej.path("bestScore").asInt();
+                        lb.add(u + " — " + sc);
+                    }
+                    updateLeaderboard(lb);
+                }
+
+                synchronized (stateLock) { lastState = s; }
+            }
+            case "error" -> {
+                String reason = n.path("reason").asText("error");
+                statusText.set("Error: " + reason);
+                if ("room_full".equals(reason)) {
+                    // stay in lobby
+                }
+                // re-enable auth buttons if not authed
+                if (!authed) enableAuthButtons(true);
+            }
+            default -> {}
         }
     }
 
-    private void renderNoState(GraphicsContext g, String msg) {
-        g.setFill(Color.rgb(18, 18, 22));
-        g.fillRect(0, 0, 800, 600);
-        g.setFill(Color.LIGHTGRAY);
-        g.fillText(msg, 20, 30);
+    // We find controls via scene lookup to avoid storing references (keeps example compact).
+    private void enableAuthButtons(boolean enabled) {
+        Scene sc = getPrimaryScene();
+        if (sc == null) return;
+        for (javafx.scene.Node node : sc.getRoot().lookupAll(".button")) {
+            if (node instanceof Button b) {
+                if ("Login".equals(b.getText()) || "Register".equals(b.getText())) {
+                    b.setDisable(!enabled);
+                }
+            }
+        }
     }
 
-    private void render(GraphicsContext g, Messages.State st, String myPlayerId) {
-        g.setFill(Color.rgb(18, 18, 22));
-        g.fillRect(0, 0, 800, 600);
+    private void enableRoomControls(boolean enabled) {
+        Scene sc = getPrimaryScene();
+        if (sc == null) return;
+        for (javafx.scene.Node node : sc.getRoot().lookupAll(".text-field")) {
+            if (node instanceof TextField tf && "Room ID (e.g. MAIN)".equals(tf.getPromptText())) {
+                tf.setDisable(!enabled);
+            }
+        }
+        for (javafx.scene.Node node : sc.getRoot().lookupAll(".button")) {
+            if (node instanceof Button b) {
+                if ("Create room".equals(b.getText()) || "Join room".equals(b.getText())) {
+                    b.setDisable(!enabled);
+                }
+                if ("Login".equals(b.getText()) || "Register".equals(b.getText())) {
+                    b.setDisable(true);
+                }
+            }
+        }
+    }
 
-        if (st == null) {
-            g.setFill(Color.LIGHTGRAY);
-            g.fillText("Waiting for state...", 20, 30);
-            return;
+    private void updateRoomInfo(String roomId, int players, int cap) {
+        Scene sc = getPrimaryScene();
+        if (sc == null) return;
+        for (javafx.scene.Node node : sc.getRoot().lookupAll(".label")) {
+            if (node instanceof Label l && l.getText().startsWith("Room:")) {
+                l.setText("Room: " + roomId + " (" + players + "/" + cap + ")");
+            }
+        }
+    }
+
+    private void updateLeaderboard(List<String> entries) {
+        Scene sc = getPrimaryScene();
+        if (sc == null) return;
+        for (javafx.scene.Node node : sc.getRoot().lookupAll(".list-view")) {
+            if (node instanceof ListView<?> lv) {
+                @SuppressWarnings("unchecked")
+                ListView<String> lvs = (ListView<String>) lv;
+                lvs.getItems().setAll(entries);
+            }
+        }
+    }
+
+    private Scene getPrimaryScene() {
+        // hacky but works for a single-stage app
+        for (javafx.stage.Window w : javafx.stage.Window.getWindows()) {
+            if (w instanceof Stage s && s.getScene() != null) return s.getScene();
+        }
+        return null;
+    }
+
+    private void render(GraphicsContext g, Canvas canvas, Messages.State s) {
+        int cs = s.cellSize <= 0 ? 10 : s.cellSize;
+        int w = s.gridW * cs;
+        int h = s.gridH * cs;
+
+        // resize canvas to fit grid (optional)
+        if (canvas.getWidth() != w || canvas.getHeight() != h) {
+            canvas.setWidth(w);
+            canvas.setHeight(h);
         }
 
-        Map<Integer, Color> idxToColor = new HashMap<>();
-        if (st.players != null) {
-            for (Messages.Player p : st.players) idxToColor.put(p.idx, parseHex(p.color, Color.CORNFLOWERBLUE));
+        // background
+        g.setFill(Color.rgb(15, 15, 20));
+        g.fillRect(0, 0, w, h);
+
+        // build color map by idx from players list
+        Map<Integer, Color> colorByIdx = new HashMap<>();
+        for (Messages.Player p : s.players) {
+            try { colorByIdx.put(p.idx, Color.web(p.color)); }
+            catch (Exception ignored) { colorByIdx.put(p.idx, Color.WHITE); }
         }
 
-        // territories
-        if (st.owners != null) {
-            int w = st.gridW, h = st.gridH, cell = st.cellSize;
-            for (int y = 0; y < h; y++) {
-                int row = y * w;
-                for (int x = 0; x < w; x++) {
-                    int owner = st.owners[row + x];
-                    if (owner == 0) continue;
-                    g.setFill(idxToColor.getOrDefault(owner, Color.GRAY));
-                    g.fillRect(x * cell, y * cell, cell, cell);
+        // draw territory
+        for (int y = 0; y < s.gridH; y++) {
+            for (int x = 0; x < s.gridW; x++) {
+                int o = s.owners[y * s.gridW + x];
+                if (o == 0) continue;
+                Color c = colorByIdx.getOrDefault(o, Color.GRAY);
+                g.setFill(c);
+                g.fillRect(x * cs, y * cs, cs, cs);
+            }
+        }
+
+        // draw trails semi-transparent
+        for (Messages.Player p : s.players) {
+            Color base = colorByIdx.getOrDefault(p.idx, Color.WHITE);
+            Color t = new Color(base.getRed(), base.getGreen(), base.getBlue(), 0.45);
+            g.setFill(t);
+            if (p.trail != null) {
+                for (Messages.Cell c : p.trail) {
+                    g.fillRect(c.x * cs, c.y * cs, cs, cs);
                 }
             }
         }
 
-        // trails (semi-transparent)
-        if (st.players != null) {
-            for (Messages.Player p : st.players) {
-                if (p.trail == null) continue;
-                Color base = parseHex(p.color, Color.CORNFLOWERBLUE);
-                g.setFill(new Color(base.getRed(), base.getGreen(), base.getBlue(), 0.55));
-                for (Messages.Cell c : p.trail) g.fillRect(c.x * st.cellSize, c.y * st.cellSize, st.cellSize, st.cellSize);
-            }
-        }
-
-        // players
-        if (st.players != null) {
-            for (Messages.Player p : st.players) {
-                Color base = parseHex(p.color, Color.CORNFLOWERBLUE);
-                double size = 16;
-
-                g.setFill(Color.BLACK);
-                g.fillRoundRect(p.x, p.y, size, size, 6, 6);
-
-                g.setFill(base);
-                g.fillRoundRect(p.x + 2, p.y + 2, size - 4, size - 4, 5, 5);
-
-                if (p.playerId != null && p.playerId.equals(myPlayerId)) {
-                    g.setStroke(Color.WHITE);
-                    g.strokeRoundRect(p.x - 2, p.y - 2, size + 4, size + 4, 8, 8);
-                }
-
-                g.setFill(Color.WHITE);
-                g.fillText(p.username + " (" + p.score + ")", p.x, p.y - 6);
-            }
-        }
-
-        // match scoreboard
-        g.setFill(Color.rgb(255, 255, 255, 0.9));
-        g.fillText("Match scoreboard:", 12, 18);
-        double y = 38;
-        if (st.players != null) {
-            int limit = Math.min(10, st.players.size());
-            for (int i = 0; i < limit; i++) {
-                Messages.Player p = st.players.get(i);
-                g.fillText((i + 1) + ". " + p.username + " — " + p.score, 12, y);
-                y += 16;
-            }
+        // draw players
+        for (Messages.Player p : s.players) {
+            Color c = colorByIdx.getOrDefault(p.idx, Color.WHITE);
+            g.setFill(c.brighter());
+            g.fillOval(p.x * cs, p.y * cs, cs, cs);
+            g.setFill(Color.WHITE);
+            g.fillText(p.username + " (" + p.score + ")", p.x * cs + 2, p.y * cs - 2);
         }
     }
 
-    private static Color parseHex(String hex, Color fallback) {
-        if (hex == null) return fallback;
-        try { return Color.web(hex); } catch (Exception e) { return fallback; }
+    @Override public void stop() {
+        try { pingExec.shutdownNow(); } catch (Exception ignored) {}
+        try { if (net != null) net.close(); } catch (Exception ignored) {}
     }
-
-    public static void main(String[] args) { launch(args); }
 }
