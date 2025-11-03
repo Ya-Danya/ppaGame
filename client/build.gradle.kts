@@ -1,6 +1,10 @@
 plugins {
     application
-    id("org.openjfx.javafxplugin")
+    id("org.openjfx.javafxplugin") version "0.1.0"
+}
+
+java {
+    toolchain { languageVersion.set(JavaLanguageVersion.of(17)) }
 }
 
 dependencies {
@@ -8,8 +12,10 @@ dependencies {
 }
 
 javafx {
-    version = "17.0.10"
+    version = "21.0.4"
     modules = listOf("javafx.controls", "javafx.graphics")
 }
 
-application { mainClass.set("com.example.paperfx.client.ClientMain") }
+application {
+    mainClass.set("com.example.paperfx.client.ClientMain")
+}
