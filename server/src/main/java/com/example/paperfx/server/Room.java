@@ -1,303 +1,305 @@
 package com.example.paperfx.server;
 
 import com.example.paperfx.common.Messages;
+import com.example.paperfx.common.Net;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 
+import java.sql.SQLException;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 
 final class Room {
+    static final int CELL = 10;
+    static final int GRID_W = 80;
+    static final int GRID_H = 60;
+
+    static final double PLAYER_SIZE = 16;
+    static final double PLAYER_SPEED = 240;
+
+    static final int SPAWN_R = 3;
+    static final int ROOM_CAPACITY = 4;
+
+    static final long CHAT_COOLDOWN_MS = 5_000;
+    static final int CHAT_MAX_LEN = 300;
+
+    final ServerMain server;
     final String roomId;
-    final int capacity;
-    final int gridW;
-    final int gridH;
-    final int cellSize;
-    final int[] owners;        // 0 = neutral, else idx of player
-    final int[] trailOwners;   // 0 = none, else idx of player trail
-    final Map<String, PlayerEntity> players = new ConcurrentHashMap<>();
-    private final Random rng = new Random();
 
-    private long tick = 0;
+    final int[] owners = new int[GRID_W * GRID_H];
 
-    Room(String roomId, int capacity, int gridW, int gridH, int cellSize) {
+    final ConcurrentHashMap<String, PlayerEntity> players = new ConcurrentHashMap<>();
+    final ConcurrentHashMap<Integer, String> idxToPlayerId = new ConcurrentHashMap<>();
+
+    final Random rnd = new Random();
+
+    Room(ServerMain server, String roomId) {
+        this.server = server;
         this.roomId = roomId;
-        this.capacity = capacity;
-        this.gridW = gridW;
-        this.gridH = gridH;
-        this.cellSize = cellSize;
-        this.owners = new int[gridW * gridH];
-        this.trailOwners = new int[gridW * gridH];
     }
 
-    int playersCount() { return players.size(); }
+    int toIndex(int x, int y) { return y * GRID_W + x; }
 
-    synchronized boolean addPlayer(PlayerEntity p) {
-        if (players.size() >= capacity) return false;
-        // assign idx must be unique within room
-        int idx = allocIdx();
-        p.idx = idx;
+    int countTerritoryCells(int idx) {
+        int n = 0;
+        for (int o : owners) if (o == idx) n++;
+        return n;
+    }
 
-        // place player
-        int[] spawn = findSpawn();
-        p.x = spawn[0];
-        p.y = spawn[1];
-        p.dx = 0;
-        p.dy = 0;
-        p.trail.clear();
-        p.drawing = false;
+    int allocIdx() {
+        for (int i = 1; i <= ROOM_CAPACITY; i++) if (!idxToPlayerId.containsKey(i)) return i;
+        return -1;
+    }
 
-        // initial territory 3x3, only paint neutral to avoid "spawn steal"
-        int sx = (int) p.x;
-        int sy = (int) p.y;
-        for (int yy = sy - 1; yy <= sy + 1; yy++) {
-            for (int xx = sx - 1; xx <= sx + 1; xx++) {
-                if (!inside(xx, yy)) continue;
-                int i = idx(xx, yy);
-                if (owners[i] == 0) owners[i] = idx;
+    void giveInitialTerritory(int idx, int cx, int cy) {
+        for (int y = cy - SPAWN_R; y <= cy + SPAWN_R; y++) {
+            for (int x = cx - SPAWN_R; x <= cx + SPAWN_R; x++) {
+                if (x < 0 || y < 0 || x >= GRID_W || y >= GRID_H) continue;
+                owners[toIndex(x, y)] = idx;
             }
         }
-
-        players.put(p.playerId, p);
-        return true;
     }
 
-    synchronized void removePlayer(String playerId) {
+    void join(ClientConn c, boolean spectator) {
+        if (spectator) {
+            c.roomId = roomId;
+            c.spectator = true;
+            sendRoomJoined(c, true, null);
+            return;
+        }
+
+        if (players.size() >= ROOM_CAPACITY) {
+            c.sendJson(ServerMain.error("room_full"));
+            return;
+        }
+
+        int idx = allocIdx();
+        if (idx < 0) {
+            c.sendJson(ServerMain.error("room_full"));
+            return;
+        }
+
+        // If switching rooms, remove old player
+        if (c.playerId != null && c.roomId != null) {
+            Room old = server.rooms.get(c.roomId);
+            if (old != null) old.removePlayer(c.playerId, true);
+        }
+
+        String pid = UUID.randomUUID().toString();
+        int sx = rnd.nextInt(GRID_W);
+        int sy = rnd.nextInt(GRID_H);
+
+        double px = sx * CELL + (CELL - PLAYER_SIZE) / 2.0;
+        double py = sy * CELL + (CELL - PLAYER_SIZE) / 2.0;
+
+        String color = ServerMain.pickColor(roomId, c.username);
+
+        PlayerEntity p = new PlayerEntity(c.userId, c.username, pid, idx, color, px, py, sx, sy);
+        players.put(pid, p);
+        idxToPlayerId.put(idx, pid);
+
+        c.playerId = pid;
+        c.roomId = roomId;
+        c.spectator = false;
+
+        giveInitialTerritory(idx, sx, sy);
+
+        sendRoomJoined(c, false, pid);
+    }
+
+    void sendRoomJoined(ClientConn c, boolean spectator, String pid) {
+        ObjectNode msg = Net.MAPPER.createObjectNode();
+        msg.put("type", "room_joined");
+        msg.put("roomId", roomId);
+        msg.put("capacity", ROOM_CAPACITY);
+        msg.put("spectator", spectator);
+        if (pid != null) msg.put("playerId", pid);
+        msg.put("players", players.size());
+        c.sendJson(msg);
+    }
+
+    void removePlayer(String playerId, boolean keepTerritory) {
+        if (playerId == null) return;
         PlayerEntity p = players.remove(playerId);
         if (p == null) return;
-        // clear trail cells
-        for (Messages.Cell c : p.trail) {
-            if (inside(c.x, c.y)) trailOwners[idx(c.x, c.y)] = 0;
-        }
-        // release territory to neutral
-        for (int i = 0; i < owners.length; i++) {
-            if (owners[i] == p.idx) owners[i] = 0;
-            if (trailOwners[i] == p.idx) trailOwners[i] = 0;
+        idxToPlayerId.remove(p.idx);
+        p.clearTrail();
+
+        try { server.db.recordResult(p.userId, p.score); }
+        catch (SQLException e) { System.err.println("[server] recordResult error: " + e.getMessage()); }
+
+        if (!keepTerritory) {
+            for (int i = 0; i < owners.length; i++) if (owners[i] == p.idx) owners[i] = 0;
         }
     }
 
-    synchronized void setInput(String playerId, int dx, int dy) {
-        PlayerEntity p = players.get(playerId);
-        if (p == null) return;
-        // prevent diagonal
-        if (dx != 0 && dy != 0) { dx = 0; dy = 0; }
-        // normalize
-        if (dx > 0) dx = 1; if (dx < 0) dx = -1;
-        if (dy > 0) dy = 1; if (dy < 0) dy = -1;
-        p.dx = dx;
-        p.dy = dy;
+    void killAndRespawn(PlayerEntity victim, String reason) {
+        try { server.db.recordResult(victim.userId, victim.score); }
+        catch (SQLException e) { System.err.println("[server] recordResult error: " + e.getMessage()); }
+
+        for (int i = 0; i < owners.length; i++) if (owners[i] == victim.idx) owners[i] = 0;
+        victim.clearTrail();
+
+        int sx = rnd.nextInt(GRID_W);
+        int sy = rnd.nextInt(GRID_H);
+
+        victim.x = sx * CELL + (CELL - PLAYER_SIZE) / 2.0;
+        victim.y = sy * CELL + (CELL - PLAYER_SIZE) / 2.0;
+        victim.cellX = sx;
+        victim.cellY = sy;
+
+        giveInitialTerritory(victim.idx, sx, sy);
+        victim.deadCooldownTicks = 10;
+
+        System.out.println("[server][" + roomId + "] " + victim.username + " died: " + reason);
     }
 
-    synchronized void step() {
-        tick++;
+    void step(double dt) {
+        for (PlayerEntity p : players.values()) {
+            if (p.deadCooldownTicks > 0) { p.deadCooldownTicks--; continue; }
 
-        // move each player one cell per tick if input present
-        for (PlayerEntity p : new ArrayList<>(players.values())) {
-            if (p.dx == 0 && p.dy == 0) continue;
+            int oldCx = p.cellX;
+            int oldCy = p.cellY;
 
-            int nx = (int) p.x + p.dx;
-            int ny = (int) p.y + p.dy;
-            if (!inside(nx, ny)) continue;
+            p.x = ServerMain.clamp(p.x + (p.inputDx * PLAYER_SPEED) * dt, 0, GRID_W * (double) CELL - PLAYER_SIZE);
+            p.y = ServerMain.clamp(p.y + (p.inputDy * PLAYER_SPEED) * dt, 0, GRID_H * (double) CELL - PLAYER_SIZE);
 
-            // collision with trails (including self)
-            int ti = idx(nx, ny);
-            int hitTrailIdx = trailOwners[ti];
-            if (hitTrailIdx != 0) {
-                // someone hits a trail -> owner of that trail dies
-                PlayerEntity victim = findByIdx(hitTrailIdx);
-                if (victim != null) {
-                    kill(victim, "trail_hit");
-                }
-                // if you hit your own trail, you die as well in this model
-                if (hitTrailIdx == p.idx) {
-                    kill(p, "self_trail_hit");
-                }
-                continue;
-            }
+            int newCx = ServerMain.clampInt((int) Math.floor((p.x + PLAYER_SIZE / 2.0) / CELL), 0, GRID_W - 1);
+            int newCy = ServerMain.clampInt((int) Math.floor((p.y + PLAYER_SIZE / 2.0) / CELL), 0, GRID_H - 1);
 
-            // advance
-            p.x = nx;
-            p.y = ny;
-
-            int oi = owners[ti];
-            if (!p.drawing) {
-                // start drawing when leaving own territory
-                if (oi != p.idx) {
-                    p.drawing = true;
-showTrailAdd(p, nx, ny);
-                }
-            } else {
-                // while drawing, mark trail
-                showTrailAdd(p, nx, ny);
-
-                if (oi == p.idx) {
-                    // closed loop: capture area
-                    capture(p);
+            if (newCx != oldCx || newCy != oldCy) {
+                for (int[] c : ServerMain.bresenham(oldCx, oldCy, newCx, newCy)) {
+                    if (c[0] == oldCx && c[1] == oldCy) continue;
+                    p.cellX = c[0];
+                    p.cellY = c[1];
+                    onEnterCell(p, c[0], c[1]);
                 }
             }
+
+            p.score = countTerritoryCells(p.idx);
         }
     }
 
-    private void showTrailAdd(PlayerEntity p, int x, int y) {
-        // do not mark trail on own territory cells; keeps trail compact
-        if (!inside(x, y)) return;
-        int i = idx(x, y);
-        if (owners[i] == p.idx) return;
-        if (trailOwners[i] == 0) {
-            trailOwners[i] = p.idx;
-            p.trail.add(new Messages.Cell(x, y));
-        }
-    }
-
-    private void kill(PlayerEntity victim, String reason) {
-        // wipe victim trail and territory; victim respawns immediately (join-in-progress OK)
-        for (Messages.Cell c : victim.trail) {
-            if (inside(c.x, c.y)) trailOwners[idx(c.x, c.y)] = 0;
-        }
-        victim.trail.clear();
-        victim.drawing = false;
-
-        for (int i = 0; i < owners.length; i++) {
-            if (owners[i] == victim.idx) owners[i] = 0;
-            if (trailOwners[i] == victim.idx) trailOwners[i] = 0;
-        }
-
-        int[] spawn = findSpawn();
-        victim.x = spawn[0];
-        victim.y = spawn[1];
-        victim.dx = 0;
-        victim.dy = 0;
-
-        // give tiny starter patch again (neutral only)
-        int sx = (int) victim.x;
-        int sy = (int) victim.y;
-        for (int yy = sy - 1; yy <= sy + 1; yy++) {
-            for (int xx = sx - 1; xx <= sx + 1; xx++) {
-                if (!inside(xx, yy)) continue;
-                int i = idx(xx, yy);
-                if (owners[i] == 0) owners[i] = victim.idx;
+    private void onEnterCell(PlayerEntity mover, int x, int y) {
+        // If mover steps on someone else's trail => that OTHER dies
+        for (PlayerEntity other : players.values()) {
+            if (other.idx == mover.idx) continue;
+            if (other.deadCooldownTicks > 0) continue;
+            if (other.trailSet.contains(ServerMain.key(x, y))) {
+                killAndRespawn(other, "trail intersected by " + mover.username);
             }
         }
+
+        int idx = mover.idx;
+        boolean inOwnTerritory = owners[toIndex(x, y)] == idx;
+        boolean inOwnTrail = mover.trailSet.contains(ServerMain.key(x, y));
+
+        if (!inOwnTerritory) {
+            addTrail(mover, x, y);
+            // touches own trail => partial closure => capture
+            if (inOwnTrail && mover.trailList.size() >= 2) captureLoopOverwrite(mover);
+        } else {
+            if (!mover.trailList.isEmpty()) captureLoopOverwrite(mover);
+        }
     }
 
-    private void capture(PlayerEntity p) {
-        // Convert trail to solid territory (including stealing other territory)
-        for (Messages.Cell c : p.trail) {
-            if (!inside(c.x, c.y)) continue;
-            int i = idx(c.x, c.y);
-            owners[i] = p.idx;
-            trailOwners[i] = 0;
-        }
+    private void addTrail(PlayerEntity p, int x, int y) {
+        long k = ServerMain.key(x, y);
+        if (p.trailSet.add(k)) p.trailList.add(new Messages.Cell(x, y));
+    }
 
-        // "walls" = your territory + your trail (already converted to territory)
-        boolean[] wall = new boolean[owners.length];
-        for (int i = 0; i < owners.length; i++) {
-            if (owners[i] == p.idx) wall[i] = true;
-            if (trailOwners[i] == p.idx) wall[i] = true;
-        }
+    /**
+     * Capture enclosed space using flood-fill from borders.
+     * "Walls" are player's territory + player's trail.
+     * Everything not reachable from outside becomes inside => becomes player's territory.
+     * Overwrites other owners (cells "transfer" to capturer).
+     * Converts the trail itself to territory (supports 1-cell lines).
+     */
+    private void captureLoopOverwrite(PlayerEntity p) {
+        int idx = p.idx;
+        if (p.trailList.isEmpty()) return;
 
-        // flood fill outside region starting from borders
+        boolean[] blocked = new boolean[owners.length];
+        for (int i = 0; i < owners.length; i++) if (owners[i] == idx) blocked[i] = true;
+        for (Messages.Cell c : p.trailList) blocked[toIndex(c.x, c.y)] = true;
+
         boolean[] outside = new boolean[owners.length];
         ArrayDeque<Integer> q = new ArrayDeque<>();
 
-        for (int x = 0; x < gridW; x++) {
-            enqueueIfOpen(x, 0, wall, outside, q);
-            enqueueIfOpen(x, gridH - 1, wall, outside, q);
+        for (int x = 0; x < GRID_W; x++) {
+            pushIfOpen(q, outside, blocked, toIndex(x, 0));
+            pushIfOpen(q, outside, blocked, toIndex(x, GRID_H - 1));
         }
-        for (int y = 0; y < gridH; y++) {
-            enqueueIfOpen(0, y, wall, outside, q);
-            enqueueIfOpen(gridW - 1, y, wall, outside, q);
+        for (int y = 0; y < GRID_H; y++) {
+            pushIfOpen(q, outside, blocked, toIndex(0, y));
+            pushIfOpen(q, outside, blocked, toIndex(GRID_W - 1, y));
         }
 
         while (!q.isEmpty()) {
-            int cur = q.poll();
-            int cx = cur % gridW;
-            int cy = cur / gridW;
-            if (cx > 0) enqueueIfOpen(cx - 1, cy, wall, outside, q);
-            if (cx + 1 < gridW) enqueueIfOpen(cx + 1, cy, wall, outside, q);
-            if (cy > 0) enqueueIfOpen(cx, cy - 1, wall, outside, q);
-            if (cy + 1 < gridH) enqueueIfOpen(cx, cy + 1, wall, outside, q);
+            int cur = q.removeFirst();
+            int cx = cur % GRID_W;
+            int cy = cur / GRID_W;
+            if (cx > 0) pushIfOpen(q, outside, blocked, cur - 1);
+            if (cx + 1 < GRID_W) pushIfOpen(q, outside, blocked, cur + 1);
+            if (cy > 0) pushIfOpen(q, outside, blocked, cur - GRID_W);
+            if (cy + 1 < GRID_H) pushIfOpen(q, outside, blocked, cur + GRID_W);
         }
 
-        // inside cells are those not outside and not wall -> become your territory
         for (int i = 0; i < owners.length; i++) {
-            if (!outside[i] && !wall[i]) {
-                owners[i] = p.idx; // steal if needed
-            }
+            if (blocked[i] || outside[i]) continue;
+            owners[i] = idx;
         }
 
-        // clear trail state
-        p.trail.clear();
-        p.drawing = false;
+        for (Messages.Cell c : p.trailList) owners[toIndex(c.x, c.y)] = idx;
+
+        p.clearTrail();
     }
 
-    private void enqueueIfOpen(int x, int y, boolean[] wall, boolean[] outside, ArrayDeque<Integer> q) {
-        int i = idx(x, y);
-        if (outside[i]) return;
-        if (wall[i]) return;
+    private static void pushIfOpen(ArrayDeque<Integer> q, boolean[] outside, boolean[] blocked, int i) {
+        if (blocked[i] || outside[i]) return;
         outside[i] = true;
-        q.add(i);
+        q.addLast(i);
     }
 
-    synchronized List<Messages.Player> snapshotPlayers() {
-        // compute scores by counting territory sizes
-        int maxIdx = 0;
-        for (PlayerEntity p : players.values()) maxIdx = Math.max(maxIdx, p.idx);
-        int[] score = new int[Math.max(8, maxIdx + 2)];
-        for (int o : owners) {
-            if (o > 0 && o < score.length) score[o]++;
-        }
+    void broadcastState(long tick) {
+        int[] ownersSnap = Arrays.copyOf(owners, owners.length);
 
-        List<Messages.Player> out = new ArrayList<>();
+        List<Messages.Player> ps = new ArrayList<>();
         for (PlayerEntity p : players.values()) {
-            out.add(new Messages.Player(
-                    p.playerId,
-                    p.idx,
-                    p.username,
-                    p.x,
-                    p.y,
-                    (p.idx < score.length ? score[p.idx] : 0),
-                    p.color,
-                    new ArrayList<>(p.trail)
-            ));
+            List<Messages.Cell> trail = p.trailList.isEmpty() ? null : new ArrayList<>(p.trailList);
+            ps.add(new Messages.Player(p.playerId, p.idx, p.username, p.x, p.y, p.score, p.color, trail));
         }
-        out.sort(Comparator.comparingInt(a -> a.idx));
-        return out;
+        ps.sort(Comparator.comparingInt((Messages.Player pl) -> pl.score).reversed());
+
+        // Leaderboard per room
+        List<Messages.LeaderEntry> lb = new ArrayList<>();
+        for (Messages.Player pl : ps) lb.add(new Messages.LeaderEntry(pl.username, pl.score));
+
+        Messages.State state = new Messages.State(tick, roomId, CELL, GRID_W, GRID_H, ownersSnap, ps, lb);
+
+        String line;
+        try { line = Net.toJson(state); }
+        catch (Exception e) { return; }
+
+        server.broadcastToRoom(roomId, line);
     }
 
-    long tick() { return tick; }
+    void chatSend(ClientConn from, String text) {
+        if (text == null) text = "";
+        text = text.trim();
+        if (text.isEmpty()) return;
+        if (text.length() > CHAT_MAX_LEN) { from.sendJson(ServerMain.error("chat_too_long")); return; }
 
-    private PlayerEntity findByIdx(int idx) {
-        for (PlayerEntity p : players.values()) if (p.idx == idx) return p;
-        return null;
+        long now = System.currentTimeMillis();
+        if (now - from.lastChatMs < CHAT_COOLDOWN_MS) { from.sendJson(ServerMain.error("chat_rate_limit")); return; }
+        from.lastChatMs = now;
+
+        ObjectNode msg = Net.MAPPER.createObjectNode();
+        msg.put("type", "chat_msg");
+        msg.put("roomId", roomId);
+        msg.put("from", from.username);
+        msg.put("text", text);
+        msg.put("ts", now);
+
+        server.broadcastJsonToRoom(roomId, msg);
     }
-
-    private int allocIdx() {
-        // find smallest positive integer not used
-        boolean[] used = new boolean[64];
-        for (PlayerEntity p : players.values()) {
-            if (p.idx > 0 && p.idx < used.length) used[p.idx] = true;
-        }
-        for (int i = 1; i < used.length; i++) if (!used[i]) return i;
-        return 1 + rng.nextInt(60);
-    }
-
-    private int[] findSpawn() {
-        // try to find neutral area with 3x3 empty-ish
-        for (int attempt = 0; attempt < 200; attempt++) {
-            int x = 2 + rng.nextInt(gridW - 4);
-            int y = 2 + rng.nextInt(gridH - 4);
-            boolean ok = true;
-            for (int yy = y - 1; yy <= y + 1 && ok; yy++) {
-                for (int xx = x - 1; xx <= x + 1; xx++) {
-                    int i = idx(xx, yy);
-                    if (owners[i] != 0) { ok = false; break; }
-                    if (trailOwners[i] != 0) { ok = false; break; }
-                }
-            }
-            if (ok) return new int[]{x, y};
-        }
-        return new int[]{gridW / 2, gridH / 2};
-    }
-
-    private boolean inside(int x, int y) { return x >= 0 && y >= 0 && x < gridW && y < gridH; }
-    private int idx(int x, int y) { return y * gridW + x; }
 }

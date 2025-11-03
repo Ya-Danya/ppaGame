@@ -9,6 +9,7 @@ dependencies {
 
 application { mainClass.set("com.example.paperfx.server.ServerMain") }
 
+/** Simple .env loader for gradle :server:run (host launch). */
 fun loadDotEnv(): Map<String, String> {
     val f = rootProject.file(".env")
     if (!f.exists()) return emptyMap()

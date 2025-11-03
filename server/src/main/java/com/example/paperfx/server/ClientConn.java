@@ -1,74 +1,64 @@
 package com.example.paperfx.server;
 
-import com.example.paperfx.common.Messages;
 import com.example.paperfx.common.Net;
 import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 
 import java.io.*;
 import java.net.Socket;
-import java.nio.charset.StandardCharsets;
-import java.util.Objects;
-import java.util.concurrent.atomic.AtomicBoolean;
 
-final class ClientConn implements Runnable {
+final class ClientConn implements Closeable {
+    final ServerMain server;
     final Socket socket;
     final BufferedReader in;
-    final BufferedWriter out;
-    final ServerMain server;
+    final PrintWriter out;
 
-    final AtomicBoolean closed = new AtomicBoolean(false);
-
-    volatile String userId = null;
-    volatile String username = null;
-    volatile String playerId = null;
-    volatile String roomId = null;
     volatile boolean authed = false;
+    volatile String userId;
+    volatile String username;
 
-    ClientConn(Socket socket, ServerMain server) throws IOException {
-        this.socket = socket;
+    volatile String roomId = "MAIN";
+    volatile String playerId;
+    volatile boolean spectator = false;
+
+    volatile long lastChatMs = 0;
+
+    ClientConn(ServerMain server, Socket socket) throws IOException {
         this.server = server;
-        this.socket.setKeepAlive(true);
-        this.in = new BufferedReader(new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8));
-        this.out = new BufferedWriter(new OutputStreamWriter(socket.getOutputStream(), StandardCharsets.UTF_8));
+        this.socket = socket;
+        this.in = new BufferedReader(new InputStreamReader(socket.getInputStream(), "UTF-8"));
+        this.out = new PrintWriter(new OutputStreamWriter(socket.getOutputStream(), "UTF-8"), true);
     }
 
-    void send(Object msg) {
-        try {
-            String line = Net.toJson(msg);
-            synchronized (out) {
-                out.write(line);
-                out.write("\n");
-                out.flush();
-            }
-        } catch (Exception e) {
-            close();
-        }
+    void start() {
+        Thread t = new Thread(this::run, "client-" + socket.getPort());
+        t.setDaemon(true);
+        t.start();
     }
 
-    void close() {
-        if (!closed.compareAndSet(false, true)) return;
-        try { socket.close(); } catch (IOException ignored) {}
-        server.onDisconnected(this);
-    }
-
-    @Override public void run() {
+    void run() {
         try {
             String line;
-            while (!closed.get() && (line = in.readLine()) != null) {
-                if (line.isBlank()) continue;
+            while ((line = in.readLine()) != null) {
                 JsonNode n = Net.parse(line);
                 String type = n.path("type").asText("");
                 server.onMessage(this, type, n);
             }
         } catch (Exception ignored) {
         } finally {
-            close();
+            server.onDisconnected(this);
         }
     }
 
-    boolean isAuthed() { return authed && userId != null && username != null; }
+    void send(String jsonLine) {
+        try { out.println(jsonLine); } catch (Exception ignored) {}
+    }
 
-    @Override public String toString() {
-        return "ClientConn{user=" + username + ", room=" + roomId + ", player=" + playerId + "}";
+    void sendJson(ObjectNode node) {
+        try { send(Net.MAPPER.writeValueAsString(node)); } catch (Exception ignored) {}
+    }
+
+    @Override public void close() {
+        try { socket.close(); } catch (Exception ignored) {}
     }
 }
