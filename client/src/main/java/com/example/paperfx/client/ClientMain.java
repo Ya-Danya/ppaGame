@@ -27,6 +27,10 @@ public final class ClientMain extends Application {
     private volatile boolean authed = false;
     private volatile boolean inRoom = false;
 
+    private ListView<String> leaderboardView;
+    private ListView<String> chatView;
+    private volatile long lastChatAtMs = 0;
+
     private final ScheduledExecutorService pingExec = Executors.newSingleThreadScheduledExecutor(r -> {
         Thread t = new Thread(r, "ping");
         t.setDaemon(true);
@@ -121,7 +125,14 @@ public final class ClientMain extends Application {
         ListView<String> leaderboard = new ListView<>();
         leaderboard.setPrefHeight(180);
 
-        VBox left = new VBox(10, authBox, roomBox, new Label("Leaderboard (best score)"), leaderboard);
+        // --- Chat ---
+        ListView<String> chatList = new ListView<>();
+        chatList.setPrefHeight(220);
+
+        this.leaderboardView = leaderboard;
+        this.chatView = chatList;
+
+        VBox left = new VBox(10, authBox, roomBox, new Label("Leaderboard (room)"), leaderboard, new Label("Chat"), chatList);
         left.setPadding(new Insets(6));
         left.setPrefWidth(280);
 
@@ -147,7 +158,11 @@ public final class ClientMain extends Application {
             else if (k == KeyCode.S || k == KeyCode.DOWN) { curDx = 0; curDy = 1; sendInput(); }
             else if (k == KeyCode.A || k == KeyCode.LEFT) { curDx = -1; curDy = 0; sendInput(); }
             else if (k == KeyCode.D || k == KeyCode.RIGHT) { curDx = 1; curDy = 0; sendInput(); }
+            else if (k == KeyCode.Q) { sendChat("Всем привет"); }
+            else if (k == KeyCode.E) { sendChat("Вхавха"); }
+            else if (k == KeyCode.R) { sendChat("Рачки))"); }
         });
+
 
         // focus/idle: reset input on focus loss
         stage.focusedProperty().addListener((obs, oldV, newV) -> {
@@ -218,6 +233,7 @@ public final class ClientMain extends Application {
             }
             case "room_joined" -> {
                 inRoom = true;
+                if (chatView != null) Platform.runLater(() -> chatView.getItems().clear());
                 String roomId = n.path("roomId").asText("-");
                 int cap = n.path("capacity").asInt(4);
                 int players = n.path("players").asInt(0);
@@ -280,6 +296,11 @@ public final class ClientMain extends Application {
 
                 synchronized (stateLock) { lastState = s; }
             }
+            case "chat_msg" -> {
+                String ru = n.path("username").asText("");
+                String text = n.path("text").asText("");
+                appendChatLine(ru + ": " + text);
+            }
             case "error" -> {
                 String reason = n.path("reason").asText("error");
                 statusText.set("Error: " + reason);
@@ -337,16 +358,28 @@ public final class ClientMain extends Application {
     }
 
     private void updateLeaderboard(List<String> entries) {
-        Scene sc = getPrimaryScene();
-        if (sc == null) return;
-        for (javafx.scene.Node node : sc.getRoot().lookupAll(".list-view")) {
-            if (node instanceof ListView<?> lv) {
-                @SuppressWarnings("unchecked")
-                ListView<String> lvs = (ListView<String>) lv;
-                lvs.getItems().setAll(entries);
-            }
-        }
+        if (leaderboardView == null) return;
+        Platform.runLater(() -> leaderboardView.getItems().setAll(entries));
     }
+
+    private void appendChatLine(String line) {
+        if (chatView == null) return;
+        Platform.runLater(() -> {
+            var items = chatView.getItems();
+            items.add(line);
+            while (items.size() > 60) items.remove(0);
+            chatView.scrollTo(items.size() - 1);
+        });
+    }
+
+    private void sendChat(String text) {
+        if (!inRoom || !authed) return;
+        long now = System.currentTimeMillis();
+        if (now - lastChatAtMs < 5000) return; // local throttle (server also enforces)
+        lastChatAtMs = now;
+        net.send(new Messages.ChatSend(text));
+    }
+
 
     private Scene getPrimaryScene() {
         // hacky but works for a single-stage app
