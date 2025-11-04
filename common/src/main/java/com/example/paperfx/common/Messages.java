@@ -2,14 +2,9 @@ package com.example.paperfx.common;
 
 import java.util.List;
 
-/**
- * Shared DTOs for TCP JSON-lines protocol.
- * Server may also send some lightweight JSON objects (e.g. room_joined/chat_msg/error) directly.
- */
+/** Shared DTOs for the TCP JSON-lines protocol. */
 public final class Messages {
     private Messages() {}
-
-    // ---------------- small structs ----------------
 
     public static final class Cell {
         public int x;
@@ -18,7 +13,6 @@ public final class Messages {
         public Cell() {}
     }
 
-    /** Used for leaderboards; value may represent room score or best score depending on server. */
     public static final class LeaderEntry {
         public String username;
         public int bestScore;
@@ -26,8 +20,7 @@ public final class Messages {
         public LeaderEntry() {}
     }
 
-    // ---------------- client -> server ----------------
-
+    // ---- client -> server ----
     public static final class Register {
         public final String type = "register";
         public String username;
@@ -44,7 +37,6 @@ public final class Messages {
         public Login() {}
     }
 
-    /** Movement input; each axis must be in {-1,0,1}. */
     public static final class Input {
         public final String type = "input";
         public int dx;
@@ -55,7 +47,7 @@ public final class Messages {
 
     public static final class CreateRoom {
         public final String type = "create_room";
-        public String roomId; // optional; if blank server generates
+        public String roomId;
         public CreateRoom(String roomId) { this.roomId = roomId; }
         public CreateRoom() {}
     }
@@ -63,7 +55,7 @@ public final class Messages {
     public static final class JoinRoom {
         public final String type = "join_room";
         public String roomId;
-        public boolean spectator = false; // reserved for future
+        public boolean spectator = false;
         public JoinRoom(String roomId) { this.roomId = roomId; }
         public JoinRoom() {}
     }
@@ -75,32 +67,14 @@ public final class Messages {
         public ChatSend() {}
     }
 
-    public static final class Ping {
-        public final String type = "ping";
-        public Ping(long l) {}
-    }
+    public static final class Ping { public final String type = "ping"; }
 
-    public static final class LeaderboardReq {
-        public final String type = "leaderboard_req";
-        public int limit = 10;
-        public LeaderboardReq(int limit) { this.limit = limit; }
-        public LeaderboardReq() {}
-    }
-
-    // ---------------- server -> client ----------------
-
-    public static final class Error {
-        public final String type = "error";
-        public String reason;
-        public Error(String reason) { this.reason = reason; }
-        public Error() {}
-    }
-
+    // ---- server -> client ----
     public static final class AuthOk {
         public final String type = "auth_ok";
         public String userId;
         public String username;
-        public String playerId; // may be empty; room_joined can carry it
+        public String playerId;
         public int idx;
         public String color;
         public int bestScore;
@@ -122,7 +96,7 @@ public final class Messages {
         public String username;
         public double x;
         public double y;
-        public int score; // current territory size (cells)
+        public int score;
         public String color;
         public List<Cell> trail;
 
@@ -139,10 +113,6 @@ public final class Messages {
         public Player() {}
     }
 
-    /**
-     * Main game-state snapshot.
-     * owners[] length = gridW*gridH, contains owner idx per cell (0 = none).
-     */
     public static final class State {
         public final String type = "state";
         public long tick;
@@ -165,49 +135,6 @@ public final class Messages {
             this.players = players;
             this.leaderboard = leaderboard;
         }
-
-        /** Back-compat constructor (roomId omitted). */
-        public State(long tick, int cellSize, int gridW, int gridH,
-                     int[] owners, List<Player> players, List<LeaderEntry> leaderboard) {
-            this(tick, null, cellSize, gridW, gridH, owners, players, leaderboard);
-        }
-
         public State() {}
-    }
-
-    // Convenience DTOs (server may also send as raw JSON objects)
-
-    public static final class RoomJoined {
-        public final String type = "room_joined";
-        public String roomId;
-        public int capacity;
-        public boolean spectator;
-        public String playerId;
-        public int players;
-
-        public RoomJoined(String roomId, int capacity, boolean spectator, String playerId, int players) {
-            this.roomId = roomId;
-            this.capacity = capacity;
-            this.spectator = spectator;
-            this.playerId = playerId;
-            this.players = players;
-        }
-        public RoomJoined() {}
-    }
-
-    public static final class ChatMsg {
-        public final String type = "chat_msg";
-        public String roomId;
-        public String from;
-        public String text;
-        public long ts;
-
-        public ChatMsg(String roomId, String from, String text, long ts) {
-            this.roomId = roomId;
-            this.from = from;
-            this.text = text;
-            this.ts = ts;
-        }
-        public ChatMsg() {}
     }
 }
