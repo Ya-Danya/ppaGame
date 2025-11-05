@@ -61,13 +61,64 @@ public final class Messages {
     }
 
     public static final class ChatSend {
+
         public final String type = "chat_send";
         public String text;
         public ChatSend(String text) { this.text = text; }
         public ChatSend() {}
     }
 
-    public static final class Ping { public final String type = "ping"; }
+    
+    public static final class SetEmoji {
+        public final String type = "set_emoji";
+        public String emoji; // "" to clear
+        public SetEmoji(String emoji) { this.emoji = emoji; }
+        public SetEmoji() {}
+    }
+
+    public static final class GetProfile {
+        public final String type = "get_profile";
+        public GetProfile() {}
+    }
+
+    public static final class Profile {
+        public final String type = "profile";
+        public String username;
+        public String selectedEmoji; // may be ""
+        public java.util.List<String> unlockedEmojis;
+        public long totalKills;
+        public long totalScore;
+        public int maxMatchScore;
+        public int maxMatchKills;
+        public int maxKillStreak;
+        public Profile() {}
+        public Profile(String username, String selectedEmoji, java.util.List<String> unlockedEmojis,
+                       long totalKills, long totalScore, int maxMatchScore, int maxMatchKills, int maxKillStreak) {
+            this.username = username;
+            this.selectedEmoji = selectedEmoji;
+            this.unlockedEmojis = unlockedEmojis;
+            this.totalKills = totalKills;
+            this.totalScore = totalScore;
+            this.maxMatchScore = maxMatchScore;
+            this.maxMatchKills = maxMatchKills;
+            this.maxKillStreak = maxKillStreak;
+        }
+    }
+
+    public static final class AchievementUnlocked {
+        public final String type = "achievement_unlocked";
+        public String code;
+        public String title;
+        public String emoji;
+        public AchievementUnlocked() {}
+        public AchievementUnlocked(String code, String title, String emoji) {
+            this.code = code;
+            this.title = title;
+            this.emoji = emoji;
+        }
+    }
+
+public static final class Ping { public final String type = "ping"; }
 
     // ---- server -> client ----
     public static final class AuthOk {
