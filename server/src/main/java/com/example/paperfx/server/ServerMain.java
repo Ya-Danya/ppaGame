@@ -21,7 +21,11 @@ public final class ServerMain {
     private final ServerSocket serverSocket;
 
     final CopyOnWriteArrayList<ClientConn> clients = new CopyOnWriteArrayList<>();
+
+    // 1 active session per username/userId
     final ConcurrentHashMap<String, ClientConn> activeByUsername = new ConcurrentHashMap<>();
+    final ConcurrentHashMap<String, ClientConn> activeByUserId = new ConcurrentHashMap<>();
+
     final ConcurrentHashMap<String, Room> rooms = new ConcurrentHashMap<>();
 
     private final AtomicLong tick = new AtomicLong(0);
@@ -63,6 +67,7 @@ public final class ServerMain {
         });
 
         final long periodMs = 50;
+
         final long[] lastNs = { System.nanoTime() };
 
         loop.scheduleAtFixedRate(() -> {
@@ -73,6 +78,8 @@ public final class ServerMain {
             for (Room room : rooms.values()) room.step(dt);
             long t = tick.incrementAndGet();
             for (Room room : rooms.values()) room.broadcastState(t);
+
+            cleanupEmptyRooms();
         }, 0, periodMs, TimeUnit.MILLISECONDS);
 
         try { while (true) Thread.sleep(10_000); } catch (InterruptedException ignored) {}
@@ -114,6 +121,8 @@ public final class ServerMain {
                 case "create_room" -> onCreateRoom(c, n);
                 case "join_room" -> onJoinRoom(c, n);
                 case "chat_send" -> onChatSend(c, n);
+                case "set_emoji" -> onSetEmoji(c, n);
+                case "get_profile" -> onGetProfile(c);
                 case "ping" -> { /* keepalive */ }
                 default -> c.sendJson(error("unknown_message"));
             }
@@ -126,10 +135,14 @@ public final class ServerMain {
         clients.remove(c);
 
         if (c.username != null) activeByUsername.remove(c.username, c);
+        if (c.userId != null) activeByUserId.remove(c.userId, c);
 
-        if (c.roomId != null && c.playerId != null) {
+        if (c.roomId != null) {
             Room room = rooms.get(c.roomId);
-            if (room != null) room.removePlayer(c.playerId, false);
+            if (room != null) {
+                if (c.spectator) room.removeSpectator(c);
+                else if (c.playerId != null) room.removePlayer(c.playerId, false);
+            }
         }
 
         try { c.close(); } catch (Exception ignored) {}
@@ -173,15 +186,63 @@ public final class ServerMain {
         c.authed = true;
         c.userId = r.userId();
         c.username = r.username();
+        c.selectedEmoji = r.selectedEmoji() == null ? "" : r.selectedEmoji();
 
+        activeByUserId.put(c.userId, c);
+
+        // auth_ok
         try {
             c.send(Net.toJson(new Messages.AuthOk(c.userId, c.username, "", 0, pickColor("MAIN", c.username), r.bestScore())));
         } catch (JsonProcessingException e) {
             throw new RuntimeException(e);
         }
 
+        // send profile (emojis + stats)
+        sendProfileTo(c);
+
         // Auto-join MAIN
-        getOrCreateRoom("MAIN").join(c, false);
+        Room main = getOrCreateRoom("MAIN");
+        if (main.players.size() >= Room.ROOM_CAPACITY) {
+            String id = "R" + Integer.toHexString(rnd.nextInt()).replace("-", "");
+            getOrCreateRoom(id).join(c, false);
+        } else {
+            main.join(c, false);
+        }
+    }
+
+    private void onGetProfile(ClientConn c) throws SQLException {
+        if (!c.authed) { c.sendJson(error("not_authenticated")); return; }
+        sendProfileTo(c);
+    }
+
+    private void sendProfileTo(ClientConn c) throws SQLException {
+        Db.Profile p = db.getProfile(c.userId);
+        if (p == null) return;
+        c.selectedEmoji = p.selectedEmoji();
+
+        Messages.Profile msg = new Messages.Profile(
+                c.username,
+                p.selectedEmoji(),
+                p.unlockedEmojis(),
+                p.totalKills(),
+                p.totalScore(),
+                p.maxMatchScore(),
+                p.maxMatchKills(),
+                p.maxKillStreak()
+        );
+        try {
+            c.send(Net.toJson(msg));
+        } catch (JsonProcessingException e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    private void onSetEmoji(ClientConn c, JsonNode n) throws SQLException {
+        if (!c.authed) { c.sendJson(error("not_authenticated")); return; }
+        String emoji = n.path("emoji").asText("");
+        boolean ok = db.setEmoji(c.userId, emoji);
+        if (!ok) { c.sendJson(error("emoji_not_unlocked")); return; }
+        sendProfileTo(c); // refresh after change
     }
 
     private void onInput(ClientConn c, JsonNode n) {
@@ -223,6 +284,28 @@ public final class ServerMain {
         room.chatSend(c, text);
     }
 
+    // ---- achievements push from game events ----
+
+    void pushUnlocked(String userId, List<Db.AchievementUnlock> unlocked) {
+        if (unlocked == null || unlocked.isEmpty()) return;
+        ClientConn c = activeByUserId.get(userId);
+        if (c == null) return;
+
+        for (Db.AchievementUnlock a : unlocked) {
+            try {
+                c.send(Net.toJson(new Messages.AchievementUnlocked(a.code(), a.title(), a.emoji())));
+            } catch (Exception ignored) {}
+        }
+
+        try { sendProfileTo(c); } catch (Exception ignored) {}
+    }
+
+    String displayName(String userId, String username) {
+        ClientConn c = activeByUserId.get(userId);
+        String emoji = (c == null) ? "" : (c.selectedEmoji == null ? "" : c.selectedEmoji.trim());
+        return emoji.isBlank() ? username : (emoji + " " + username);
+    }
+
     // ---- broadcasting ----
 
     void broadcastToRoom(String roomId, String jsonLine) {
@@ -234,10 +317,23 @@ public final class ServerMain {
     }
 
     void broadcastJsonToRoom(String roomId, ObjectNode msg) {
-        try {
-            broadcastToRoom(roomId, Net.MAPPER.writeValueAsString(msg));
-        } catch (Exception ignored) {}
+        try { broadcastToRoom(roomId, Net.MAPPER.writeValueAsString(msg)); }
+        catch (Exception ignored) {}
     }
+
+    private void cleanupEmptyRooms() {
+        long now = System.currentTimeMillis();
+        for (Map.Entry<String, Room> e : rooms.entrySet()) {
+            String id = e.getKey();
+            if ("MAIN".equals(id)) continue;
+            Room r = e.getValue();
+            if (r == null) continue;
+            if (r.isCompletelyEmpty() && now - r.lastActivityMs() > 60_000) { // 60s idle
+                rooms.remove(id, r);
+            }
+        }
+    }
+
 
     // ---- utils ----
 
