@@ -28,6 +28,12 @@ public final class ServerMain {
 
     final ConcurrentHashMap<String, Room> rooms = new ConcurrentHashMap<>();
 
+    private final ExecutorService dbExec = Executors.newSingleThreadExecutor(r -> {
+        Thread t = new Thread(r, "db-writer");
+        t.setDaemon(true);
+        return t;
+    });
+
     private final AtomicLong tick = new AtomicLong(0);
     private final Random rnd = new Random();
 
@@ -67,7 +73,6 @@ public final class ServerMain {
         });
 
         final long periodMs = 50;
-
         final long[] lastNs = { System.nanoTime() };
 
         loop.scheduleAtFixedRate(() -> {
@@ -78,8 +83,6 @@ public final class ServerMain {
             for (Room room : rooms.values()) room.step(dt);
             long t = tick.incrementAndGet();
             for (Room room : rooms.values()) room.broadcastState(t);
-
-            cleanupEmptyRooms();
         }, 0, periodMs, TimeUnit.MILLISECONDS);
 
         try { while (true) Thread.sleep(10_000); } catch (InterruptedException ignored) {}
@@ -121,8 +124,6 @@ public final class ServerMain {
                 case "create_room" -> onCreateRoom(c, n);
                 case "join_room" -> onJoinRoom(c, n);
                 case "chat_send" -> onChatSend(c, n);
-                case "set_emoji" -> onSetEmoji(c, n);
-                case "get_profile" -> onGetProfile(c);
                 case "ping" -> { /* keepalive */ }
                 default -> c.sendJson(error("unknown_message"));
             }
@@ -137,12 +138,10 @@ public final class ServerMain {
         if (c.username != null) activeByUsername.remove(c.username, c);
         if (c.userId != null) activeByUserId.remove(c.userId, c);
 
-        if (c.roomId != null) {
+        if (c.roomId != null && c.playerId != null) {
             Room room = rooms.get(c.roomId);
-            if (room != null) {
-                if (c.spectator) room.removeSpectator(c);
-                else if (c.playerId != null) room.removePlayer(c.playerId, false);
-            }
+            if (room != null) if (c.spectator) room.removeSpectator(c);
+            else room.removePlayer(c.playerId, false);
         }
 
         try { c.close(); } catch (Exception ignored) {}
@@ -186,63 +185,23 @@ public final class ServerMain {
         c.authed = true;
         c.userId = r.userId();
         c.username = r.username();
-        c.selectedEmoji = r.selectedEmoji() == null ? "" : r.selectedEmoji();
 
         activeByUserId.put(c.userId, c);
 
-        // auth_ok
         try {
             c.send(Net.toJson(new Messages.AuthOk(c.userId, c.username, "", 0, pickColor("MAIN", c.username), r.bestScore())));
         } catch (JsonProcessingException e) {
             throw new RuntimeException(e);
         }
 
-        // send profile (emojis + stats)
-        sendProfileTo(c);
-
-        // Auto-join MAIN
+        // Auto-join MAIN, but if MAIN is full for players -> move to a new room (only for non-spectators).
         Room main = getOrCreateRoom("MAIN");
-        if (main.players.size() >= Room.ROOM_CAPACITY) {
-            String id = "R" + Integer.toHexString(rnd.nextInt()).replace("-", "");
-            getOrCreateRoom(id).join(c, false);
+        if (main.isFullPlayers() && !c.spectator) {
+            String newId = "R" + Integer.toHexString(Math.abs(rnd.nextInt()));
+            getOrCreateRoom(newId).join(c, false);
         } else {
             main.join(c, false);
         }
-    }
-
-    private void onGetProfile(ClientConn c) throws SQLException {
-        if (!c.authed) { c.sendJson(error("not_authenticated")); return; }
-        sendProfileTo(c);
-    }
-
-    private void sendProfileTo(ClientConn c) throws SQLException {
-        Db.Profile p = db.getProfile(c.userId);
-        if (p == null) return;
-        c.selectedEmoji = p.selectedEmoji();
-
-        Messages.Profile msg = new Messages.Profile(
-                c.username,
-                p.selectedEmoji(),
-                p.unlockedEmojis(),
-                p.totalKills(),
-                p.totalScore(),
-                p.maxMatchScore(),
-                p.maxMatchKills(),
-                p.maxKillStreak()
-        );
-        try {
-            c.send(Net.toJson(msg));
-        } catch (JsonProcessingException e) {
-            throw new RuntimeException(e);
-        }
-    }
-
-    private void onSetEmoji(ClientConn c, JsonNode n) throws SQLException {
-        if (!c.authed) { c.sendJson(error("not_authenticated")); return; }
-        String emoji = n.path("emoji").asText("");
-        boolean ok = db.setEmoji(c.userId, emoji);
-        if (!ok) { c.sendJson(error("emoji_not_unlocked")); return; }
-        sendProfileTo(c); // refresh after change
     }
 
     private void onInput(ClientConn c, JsonNode n) {
@@ -265,7 +224,7 @@ public final class ServerMain {
     private void onCreateRoom(ClientConn c, JsonNode n) {
         if (!c.authed) { c.sendJson(error("not_authenticated")); return; }
         String id = n.path("roomId").asText("");
-        if (id == null || id.isBlank()) id = "R" + Integer.toHexString(rnd.nextInt()).replace("-", "");
+        if (id == null || id.isBlank()) id = "R" + Integer.toHexString(Math.abs(rnd.nextInt()));
         getOrCreateRoom(id).join(c, false);
     }
 
@@ -284,29 +243,18 @@ public final class ServerMain {
         room.chatSend(c, text);
     }
 
-    // ---- achievements push from game events ----
-
-    void pushUnlocked(String userId, List<Db.AchievementUnlock> unlocked) {
-        if (unlocked == null || unlocked.isEmpty()) return;
-        ClientConn c = activeByUserId.get(userId);
-        if (c == null) return;
-
-        for (Db.AchievementUnlock a : unlocked) {
-            try {
-                c.send(Net.toJson(new Messages.AchievementUnlocked(a.code(), a.title(), a.emoji())));
-            } catch (Exception ignored) {}
-        }
-
-        try { sendProfileTo(c); } catch (Exception ignored) {}
-    }
-
-    String displayName(String userId, String username) {
-        ClientConn c = activeByUserId.get(userId);
-        String emoji = (c == null) ? "" : (c.selectedEmoji == null ? "" : c.selectedEmoji.trim());
-        return emoji.isBlank() ? username : (emoji + " " + username);
+    
+    void recordResultAsync(String userId, int score) {
+        if (userId == null) return;
+        int s = Math.max(0, score);
+        dbExec.submit(() -> {
+            try { db.recordResult(userId, s); }
+            catch (SQLException e) { System.err.println("[server] recordResult error: " + e.getMessage()); }
+        });
     }
 
     // ---- broadcasting ----
+
 
     void broadcastToRoom(String roomId, String jsonLine) {
         for (ClientConn c : clients) {
@@ -315,25 +263,6 @@ public final class ServerMain {
             c.send(jsonLine);
         }
     }
-
-    void broadcastJsonToRoom(String roomId, ObjectNode msg) {
-        try { broadcastToRoom(roomId, Net.MAPPER.writeValueAsString(msg)); }
-        catch (Exception ignored) {}
-    }
-
-    private void cleanupEmptyRooms() {
-        long now = System.currentTimeMillis();
-        for (Map.Entry<String, Room> e : rooms.entrySet()) {
-            String id = e.getKey();
-            if ("MAIN".equals(id)) continue;
-            Room r = e.getValue();
-            if (r == null) continue;
-            if (r.isCompletelyEmpty() && now - r.lastActivityMs() > 60_000) { // 60s idle
-                rooms.remove(id, r);
-            }
-        }
-    }
-
 
     // ---- utils ----
 

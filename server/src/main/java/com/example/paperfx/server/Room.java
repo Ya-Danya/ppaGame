@@ -13,6 +13,7 @@ final class Room {
 
     private volatile long lastActivityMs = System.currentTimeMillis();
 
+
     static final int CELL = 10;
     static final int GRID_W = 80;
     static final int GRID_H = 60;
@@ -23,7 +24,7 @@ final class Room {
     static final int SPAWN_R = 3;
     static final int ROOM_CAPACITY = 4;
     static final int SPECTATOR_CAPACITY = 10;
-
+    static final int MAX_PLAYERS = 4;
 
     static final long CHAT_COOLDOWN_MS = 5_000;
     static final int CHAT_MAX_LEN = 300;
@@ -65,6 +66,11 @@ final class Room {
                 owners[toIndex(x, y)] = idx;
             }
         }
+    }
+
+
+    boolean isFullPlayers() {
+        return players.size() >= MAX_PLAYERS;
     }
 
     void join(ClientConn c, boolean spectator) {
@@ -155,8 +161,7 @@ void removeSpectator(ClientConn c) {
         idxToPlayerId.remove(p.idx);
         p.clearTrail();
 
-        try { server.pushUnlocked(p.userId, server.db.recordResult(p.userId, p.score, p.matchKills, p.killStreakMax)); }
-        catch (SQLException e) { System.err.println("[server] recordResult error: " + e.getMessage()); }
+        server.recordResultAsync(p.userId, p.score);
 
         if (!keepTerritory) {
             for (int i = 0; i < owners.length; i++) if (owners[i] == p.idx) owners[i] = 0;
@@ -164,8 +169,7 @@ void removeSpectator(ClientConn c) {
     }
 
     void killAndRespawn(PlayerEntity victim, String reason) {
-        try { server.pushUnlocked(victim.userId, server.db.recordResult(victim.userId, victim.score, victim.matchKills, victim.killStreakMax)); }
-        catch (SQLException e) { System.err.println("[server] recordResult error: " + e.getMessage()); }
+        server.recordResultAsync(victim.userId, victim.score);
 
         for (int i = 0; i < owners.length; i++) if (owners[i] == victim.idx) owners[i] = 0;
         victim.clearTrail();
@@ -180,13 +184,7 @@ void removeSpectator(ClientConn c) {
 
         giveInitialTerritory(victim.idx, sx, sy);
         victim.deadCooldownTicks = 10;
-
-        // new match for victim
-        victim.matchKills = 0;
-        victim.killStreakCurrent = 0;
-        victim.killStreakMax = 0;
-
-        System.out.println("[server][" + roomId + "] " + victim.username + " died: " + reason);
+System.out.println("[server][" + roomId + "] " + victim.username + " died: " + reason);
     }
 
     void step(double dt) {
@@ -221,16 +219,7 @@ void removeSpectator(ClientConn c) {
             if (other.idx == mover.idx) continue;
             if (other.deadCooldownTicks > 0) continue;
             if (other.trailSet.contains(ServerMain.key(x, y))) {
-                // mover killed 'other' by crossing their trail
-                mover.matchKills++;
-                mover.killStreakCurrent++;
-                mover.killStreakMax = Math.max(mover.killStreakMax, mover.killStreakCurrent);
-
-                try {
-                    server.pushUnlocked(mover.userId, server.db.addKills(mover.userId, 1));
-                } catch (Exception ignored) {}
-
-                killAndRespawn(other, "trail intersected by " + mover.username);
+                // mover killed 'other' by crossing their trail                killAndRespawn(other, "trail intersected by " + mover.username);
             }
         }
 
@@ -310,13 +299,13 @@ void removeSpectator(ClientConn c) {
         List<Messages.Player> ps = new ArrayList<>();
         for (PlayerEntity p : players.values()) {
             List<Messages.Cell> trail = p.trailList.isEmpty() ? null : new ArrayList<>(p.trailList);
-            ps.add(new Messages.Player(p.playerId, p.idx, server.displayName(p.userId, p.username), p.x, p.y, p.score, p.color, trail));
+            ps.add(new Messages.Player(p.playerId, p.idx, p.username, p.x, p.y, p.score, p.color, trail));
         }
         ps.sort(Comparator.comparingInt((Messages.Player pl) -> pl.score).reversed());
 
         // Leaderboard per room
         List<Messages.LeaderEntry> lb = new ArrayList<>();
-        for (Messages.Player pl : ps) lb.add(new Messages.LeaderEntry(server.displayName(pl.playerId, pl.username), pl.score));
+        for (Messages.Player pl : ps) lb.add(new Messages.LeaderEntry(pl.username, pl.score));
 
         Messages.State state = new Messages.State(tick, roomId, CELL, GRID_W, GRID_H, ownersSnap, ps, lb);
 
@@ -340,7 +329,7 @@ void removeSpectator(ClientConn c) {
         ObjectNode msg = Net.MAPPER.createObjectNode();
         msg.put("type", "chat_msg");
         msg.put("roomId", roomId);
-        msg.put("from", server.displayName(from.userId, from.username));
+        msg.put("from", from.username);
         msg.put("text", text);
         msg.put("ts", now);
 

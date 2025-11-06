@@ -16,10 +16,7 @@ final class PlayerEntity {
     int inputDx = 0, inputDy = 0;
 
     int score = 0;
-    int matchKills = 0;
-    int killStreakCurrent = 0;
-    int killStreakMax = 0;
-    int cellX, cellY;
+int cellX, cellY;
     int deadCooldownTicks = 0;
 
     final HashSet<Long> trailSet = new HashSet<>();

@@ -26,8 +26,6 @@ final class ClientConn implements Closeable {
 
     volatile String userId;
     volatile String username;
-    volatile String selectedEmoji = "";
-
     volatile String roomId = "MAIN";
     volatile String playerId = null;
     volatile boolean spectator = false;
