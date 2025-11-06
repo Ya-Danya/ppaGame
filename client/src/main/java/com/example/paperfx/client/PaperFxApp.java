@@ -9,7 +9,6 @@ import javafx.application.Application;
 import javafx.application.Platform;
 import javafx.collections.FXCollections;
 import javafx.collections.ObservableList;
-import javafx.event.EventTarget;
 import javafx.geometry.Insets;
 import javafx.geometry.Pos;
 import javafx.scene.Scene;
@@ -17,7 +16,6 @@ import javafx.scene.canvas.Canvas;
 import javafx.scene.canvas.GraphicsContext;
 import javafx.scene.control.*;
 import javafx.scene.input.KeyCode;
-import javafx.scene.input.KeyEvent;
 import javafx.scene.layout.*;
 import javafx.scene.paint.Color;
 import javafx.stage.Stage;
@@ -27,13 +25,7 @@ import java.net.Socket;
 import java.util.*;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicReference;
 
-/**
- * Client (no achievements/stats/emoji).
- * Includes: login/register, rooms (join/create by id), spectator mode, chat, room leaderboard.
- * Latency guard: keeps only the newest state frame and drops older ones.
- */
 public final class PaperFxApp extends Application {
 
     // ---- network ----
@@ -42,41 +34,33 @@ public final class PaperFxApp extends Application {
     private PrintWriter out;
     private Thread readerThread;
     private final ConcurrentLinkedQueue<String> inbox = new ConcurrentLinkedQueue<>();
-    private final AtomicReference<String> latestStateLine = new AtomicReference<>(null);
-    private final AtomicBoolean running = new AtomicBoolean(false);
 
     // ---- ui ----
     private Stage stage;
     private Scene loginScene;
     private Scene gameScene;
 
-    // login ui
     private TextField tfUser;
     private PasswordField pfPass;
     private TextField tfPassVisible;
     private CheckBox cbShowPass;
     private Label lblLoginStatus;
 
-    // game ui
     private Canvas canvas;
-    private StackPane canvasHost;
-    private Label roomLabel;
-    private TextField tfRoomId;
-    private CheckBox cbSpectator;
-    private Button btnJoin;
-    private Button btnCreate;
-
-    private TableView<LeaderRow> leaderboard;
-
     private ListView<String> chatView;
     private ObservableList<String> chatItems = FXCollections.observableArrayList();
     private TextField chatInput;
+    private Label roomLabel;
+    private TableView<LeaderRow> leaderboard;
 
     // ---- state ----
     private volatile Messages.State lastState;
+    private volatile String myUsername = "";
     private volatile String currentRoomId = "MAIN";
 
-    // input
+    private final AtomicBoolean running = new AtomicBoolean(false);
+
+    // input handling (prevents "stuck" when focus lost)
     private final EnumSet<KeyCode> pressed = EnumSet.noneOf(KeyCode.class);
     private int desiredDx = 0;
     private int desiredDy = 0;
@@ -91,8 +75,8 @@ public final class PaperFxApp extends Application {
         buildGameScene();
 
         stage.setScene(loginScene);
-        stage.setWidth(1200);
-        stage.setHeight(820);
+        stage.setWidth(1100);
+        stage.setHeight(760);
         stage.show();
     }
 
@@ -131,6 +115,7 @@ public final class PaperFxApp extends Application {
 
         Button btnLogin = new Button("Login");
         Button btnRegister = new Button("Register");
+
         lblLoginStatus = new Label();
 
         btnLogin.setOnAction(e -> doAuth("login"));
@@ -140,7 +125,7 @@ public final class PaperFxApp extends Application {
         passRow.setAlignment(Pos.CENTER_LEFT);
 
         VBox box = new VBox(12,
-                new Label("Server: 127.0.0.1:7777"),
+                new Label("Server: localhost:7777"),
                 tfUser,
                 passRow,
                 new HBox(10, btnLogin, btnRegister),
@@ -148,7 +133,7 @@ public final class PaperFxApp extends Application {
         );
         ((HBox)box.getChildren().get(3)).setAlignment(Pos.CENTER_LEFT);
         box.setPadding(new Insets(20));
-        box.setMaxWidth(420);
+        box.setMaxWidth(360);
 
         BorderPane root = new BorderPane();
         root.setCenter(box);
@@ -158,29 +143,11 @@ public final class PaperFxApp extends Application {
 
     private void buildGameScene() {
         canvas = new Canvas(800, 600);
-        canvasHost = new StackPane(canvas);
-        canvasHost.setMinSize(Region.USE_PREF_SIZE, Region.USE_PREF_SIZE);
-        canvasHost.setOnMouseClicked(e -> canvasHost.requestFocus()); // regain focus for movement
 
         roomLabel = new Label("Room: MAIN");
+        Label help = new Label("Move: WASD / Arrows | Chat: Q/E/R quick msgs, or type + Enter");
 
-        tfRoomId = new TextField();
-        tfRoomId.setPromptText("Room ID (e.g. MAIN, R123...)");
-
-        cbSpectator = new CheckBox("Spectator");
-
-        btnJoin = new Button("Join");
-        btnCreate = new Button("Create");
-
-        btnJoin.setOnAction(e -> joinRoom());
-        btnCreate.setOnAction(e -> createRoom());
-
-        HBox roomRow = new HBox(8, new Label("Room:"), tfRoomId, cbSpectator, btnJoin, btnCreate);
-        roomRow.setAlignment(Pos.CENTER_LEFT);
-
-        Label help = new Label("Move: WASD/Arrows | Quick chat: Q/E/R | Type in chat field + Enter");
-
-        // leaderboard
+        // leaderboard table
         leaderboard = new TableView<>();
         leaderboard.setColumnResizePolicy(TableView.CONSTRAINED_RESIZE_POLICY_ALL_COLUMNS);
         TableColumn<LeaderRow, String> colName = new TableColumn<>("User");
@@ -188,47 +155,55 @@ public final class PaperFxApp extends Application {
         TableColumn<LeaderRow, Number> colScore = new TableColumn<>("Score");
         colScore.setCellValueFactory(c -> c.getValue().scoreProperty());
         leaderboard.getColumns().addAll(colName, colScore);
-        leaderboard.setPrefHeight(260);
+        leaderboard.setPrefHeight(250);
 
         // chat
         chatView = new ListView<>(chatItems);
-        chatView.setPrefHeight(250);
+        chatView.setPrefHeight(220);
 
         chatInput = new TextField();
-        chatInput.setPromptText("Chat (<=300 chars) — Enter to send");
+        chatInput.setPromptText("Type message (<=300 chars) and press Enter");
         chatInput.setOnAction(e -> {
             String t = chatInput.getText();
             chatInput.clear();
             if (t != null && !t.isBlank()) sendChat(t.trim());
-            canvasHost.requestFocus(); // return control
         });
 
         VBox right = new VBox(10,
                 roomLabel,
                 help,
-                roomRow,
-                new Separator(),
-                new Label("Leaderboard (room)"),
+                new Label("Leaderboard"),
                 leaderboard,
-                new Separator(),
                 new Label("Chat"),
                 chatView,
                 chatInput
         );
         right.setPadding(new Insets(10));
-        right.setPrefWidth(360);
+        right.setPrefWidth(280);
 
         BorderPane root = new BorderPane();
-        root.setCenter(canvasHost);
+        root.setCenter(new StackPane(canvas));
         root.setRight(right);
 
         gameScene = new Scene(root);
 
-        // Input: use event filters so UI controls won't steal movement.
-        gameScene.addEventFilter(KeyEvent.KEY_PRESSED, this::onKeyPressedFiltered);
-        gameScene.addEventFilter(KeyEvent.KEY_RELEASED, this::onKeyReleasedFiltered);
+        // Key events on whole scene
+        gameScene.setOnKeyPressed(e -> {
+            pressed.add(e.getCode());
 
-        // focus fix (window is null until scene attached)
+            if (e.getCode() == KeyCode.Q) sendChat("Всем привет");
+            if (e.getCode() == KeyCode.E) sendChat("Вхавха");
+            if (e.getCode() == KeyCode.R) sendChat("Рачки))");
+
+            recomputeDesiredDir();
+        });
+        gameScene.setOnKeyReleased(e -> {
+            pressed.remove(e.getCode());
+            recomputeDesiredDir();
+        });
+
+        // IMPORTANT: gameScene.getWindow() is null until the scene is set on a Stage.
+        // Attach focus listener when the window becomes available.
         gameScene.windowProperty().addListener((obs, oldW, newW) -> {
             if (newW == null) return;
             newW.focusedProperty().addListener((o, was, isNow) -> {
@@ -241,64 +216,23 @@ public final class PaperFxApp extends Application {
             });
         });
 
-        new AnimationTimer() {
+        // render + network pump
+        AnimationTimer timer = new AnimationTimer() {
+            long last = 0;
             @Override public void handle(long now) {
+                if (last == 0) last = now;
+                last = now;
+
                 pumpNetwork();
                 render();
 
-                if (now - lastInputSentNs > 33_000_000) { // ~30Hz
+                if (now - lastInputSentNs > 33_000_000) { // ~30 Hz
                     sendInput(desiredDx, desiredDy);
                     lastInputSentNs = now;
                 }
             }
-        }.start();
-
-        // Make sure we start with focus on the game
-        Platform.runLater(canvasHost::requestFocus);
-    }
-
-    private void onKeyPressedFiltered(KeyEvent e) {
-        KeyCode code = e.getCode();
-
-        // If user is typing in a text field, do NOT hijack keys (except ESC)
-        boolean typing = (gameScene.getFocusOwner() instanceof TextInputControl);
-        if (typing && code != KeyCode.ESCAPE) return;
-
-        // ESC: exit typing, return focus to game
-        if (code == KeyCode.ESCAPE) {
-            canvasHost.requestFocus();
-            e.consume();
-            return;
-        }
-
-        // Quick chat hotkeys (allowed even if not typing, but not while typing)
-        if (code == KeyCode.Q) { sendChat("Всем привет"); e.consume(); return; }
-        if (code == KeyCode.E) { sendChat("Вхавха"); e.consume(); return; }
-        if (code == KeyCode.R) { sendChat("Рачки))"); e.consume(); return; }
-
-        // Movement
-        if (isMoveKey(code)) {
-            pressed.add(code);
-            recomputeDesiredDir();
-            e.consume();
-        }
-    }
-
-    private void onKeyReleasedFiltered(KeyEvent e) {
-        KeyCode code = e.getCode();
-        boolean typing = (gameScene.getFocusOwner() instanceof TextInputControl);
-        if (typing) return;
-
-        if (isMoveKey(code)) {
-            pressed.remove(code);
-            recomputeDesiredDir();
-            e.consume();
-        }
-    }
-
-    private static boolean isMoveKey(KeyCode c) {
-        return c == KeyCode.LEFT || c == KeyCode.RIGHT || c == KeyCode.UP || c == KeyCode.DOWN ||
-               c == KeyCode.A || c == KeyCode.D || c == KeyCode.W || c == KeyCode.S;
+        };
+        timer.start();
     }
 
     private void recomputeDesiredDir() {
@@ -309,11 +243,10 @@ public final class PaperFxApp extends Application {
         if (pressed.contains(KeyCode.DOWN) || pressed.contains(KeyCode.S)) dy = 1;
 
         if (dx != 0 && dy != 0) dy = 0; // no diagonal
+
         desiredDx = dx;
         desiredDy = dy;
     }
-
-    // ---- login/register ----
 
     private void doAuth(String mode) {
         String u = tfUser.getText() == null ? "" : tfUser.getText().trim();
@@ -353,19 +286,11 @@ public final class PaperFxApp extends Application {
         readerThread.start();
     }
 
-    /**
-     * Read loop drops older state frames: keeps only the newest "state" line.
-     * This prevents "delay grows with time" when network is slower than tick rate.
-     */
     private void readLoop() {
         try {
             String line;
             while (running.get() && (line = in.readLine()) != null) {
-                if (line.contains("\"type\":\"state\"")) {
-                    latestStateLine.set(line);
-                } else {
-                    inbox.add(line);
-                }
+                inbox.add(line);
             }
         } catch (IOException ignored) {
         } finally {
@@ -375,37 +300,10 @@ public final class PaperFxApp extends Application {
 
     private void sendJson(ObjectNode n) {
         try {
-            out.println(Net.MAPPER.writeValueAsString(n));
+            String line = Net.MAPPER.writeValueAsString(n);
+            out.println(line);
         } catch (Exception ignored) {}
     }
-
-    // ---- room controls ----
-
-    private void joinRoom() {
-        if (out == null) return;
-        String rid = tfRoomId.getText() == null ? "" : tfRoomId.getText().trim();
-        if (rid.isBlank()) rid = "MAIN";
-
-        ObjectNode n = Net.MAPPER.createObjectNode();
-        n.put("type", "join_room");
-        n.put("roomId", rid);
-        n.put("spectator", cbSpectator.isSelected());
-        sendJson(n);
-        canvasHost.requestFocus();
-    }
-
-    private void createRoom() {
-        if (out == null) return;
-        String rid = tfRoomId.getText() == null ? "" : tfRoomId.getText().trim();
-
-        ObjectNode n = Net.MAPPER.createObjectNode();
-        n.put("type", "create_room");
-        n.put("roomId", rid);
-        sendJson(n);
-        canvasHost.requestFocus();
-    }
-
-    // ---- gameplay messages ----
 
     private void sendInput(int dx, int dy) {
         if (out == null) return;
@@ -427,83 +325,63 @@ public final class PaperFxApp extends Application {
         sendJson(n);
     }
 
-    // ---- pump ----
-
     private void pumpNetwork() {
-        // process newest state first (cheap)
-        String stLine = latestStateLine.getAndSet(null);
-        if (stLine != null) handleLine(stLine);
-
-        // then process other messages (bounded)
         String line;
         int guard = 0;
         while (guard++ < 200 && (line = inbox.poll()) != null) {
-            handleLine(line);
+            try {
+                JsonNode n = Net.parse(line);
+                String type = n.path("type").asText("");
+
+                switch (type) {
+                    case "auth_ok" -> {
+                        myUsername = n.path("username").asText("");
+                        Platform.runLater(() -> {
+                            lblLoginStatus.setText("");
+                            stage.setScene(gameScene);
+                        });
+                    }
+                    case "room_joined" -> {
+                        currentRoomId = n.path("roomId").asText("MAIN");
+                        Platform.runLater(() -> roomLabel.setText("Room: " + currentRoomId));
+                    }
+                    case "state" -> {
+                        Messages.State st = Net.MAPPER.treeToValue(n, Messages.State.class);
+                        lastState = st;
+                        if (st.roomId != null && !st.roomId.isBlank()) currentRoomId = st.roomId;
+                        Platform.runLater(() -> {
+                            roomLabel.setText("Room: " + currentRoomId);
+                            updateLeaderboard(st);
+                        });
+                    }
+                    case "chat_msg" -> {
+                        String from = n.path("from").asText("?");
+                        String text = n.path("text").asText("");
+                        Platform.runLater(() -> {
+                            chatItems.add(from + ": " + text);
+                            if (chatItems.size() > 200) chatItems.remove(0);
+                            chatView.scrollTo(chatItems.size() - 1);
+                        });
+                    }
+                    case "error" -> {
+                        String reason = n.path("reason").asText("error");
+                        Platform.runLater(() -> {
+                            if (stage.getScene() == loginScene) lblLoginStatus.setText(reason);
+                            else chatItems.add("[error] " + reason);
+                        });
+                    }
+                    default -> { /* ignore */ }
+                }
+            } catch (Exception ignored) {}
         }
-    }
-
-    private void handleLine(String line) {
-        try {
-            JsonNode n = Net.parse(line);
-            String type = n.path("type").asText("");
-
-            switch (type) {
-                case "auth_ok" -> Platform.runLater(() -> {
-                    lblLoginStatus.setText("");
-                    stage.setScene(gameScene);
-                    canvasHost.requestFocus();
-                });
-                case "room_joined" -> {
-                    currentRoomId = n.path("roomId").asText("MAIN");
-                    Platform.runLater(() -> roomLabel.setText("Room: " + currentRoomId));
-                }
-                case "state" -> {
-                    Messages.State st = Net.MAPPER.treeToValue(n, Messages.State.class);
-                    lastState = st;
-                    if (st.roomId != null && !st.roomId.isBlank()) currentRoomId = st.roomId;
-                    Platform.runLater(() -> {
-                        roomLabel.setText("Room: " + currentRoomId);
-                        updateLeaderboard(st);
-                    });
-                }
-                case "chat_msg" -> {
-                    String from = n.path("from").asText("?");
-                    String text = n.path("text").asText("");
-                    Platform.runLater(() -> {
-                        chatItems.add(from + ": " + text);
-                        trimChat();
-                    });
-                }
-                case "error" -> {
-                    String reason = n.path("reason").asText("error");
-                    Platform.runLater(() -> {
-                        if (stage.getScene() == loginScene) lblLoginStatus.setText(reason);
-                        else {
-                            chatItems.add("[error] " + reason);
-                            trimChat();
-                        }
-                    });
-                }
-                default -> { /* ignore */ }
-            }
-        } catch (Exception ignored) {}
-    }
-
-    private void trimChat() {
-        if (chatItems.size() > 300) chatItems.remove(0);
-        chatView.scrollTo(chatItems.size() - 1);
     }
 
     private void updateLeaderboard(Messages.State st) {
         if (st == null || st.leaderboard == null) return;
         List<LeaderRow> rows = new ArrayList<>();
-        for (Messages.LeaderEntry e : st.leaderboard) {
-            rows.add(new LeaderRow(e.username, e.bestScore));
-        }
+        for (Messages.LeaderEntry e : st.leaderboard) rows.add(new LeaderRow(e.username, e.bestScore));
         leaderboard.setItems(FXCollections.observableArrayList(rows));
     }
-
-    // ---- render ----
 
     private void render() {
         Messages.State st = lastState;
@@ -517,7 +395,6 @@ public final class PaperFxApp extends Application {
         int gw = st.gridW;
         int gh = st.gridH;
 
-        // keep canvas in sync with server grid (prevents drift)
         double targetW = gw * (double) cell;
         double targetH = gh * (double) cell;
         if (canvas.getWidth() != targetW || canvas.getHeight() != targetH) {
@@ -536,7 +413,6 @@ public final class PaperFxApp extends Application {
             }
         }
 
-        // players + trails
         if (st.players != null) {
             for (Messages.Player p : st.players) {
                 if (p.trail != null) {
@@ -560,7 +436,7 @@ public final class PaperFxApp extends Application {
     @Override
     public void stop() throws Exception {
         running.set(false);
-        try { if (socket != null) socket.close(); } catch (Exception ignored) {}
+        if (socket != null) socket.close();
         super.stop();
     }
 }

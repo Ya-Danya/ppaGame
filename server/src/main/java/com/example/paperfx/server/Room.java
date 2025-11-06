@@ -9,11 +9,6 @@ import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 
 final class Room {
-    private void touch() { lastActivityMs = System.currentTimeMillis(); }
-
-    private volatile long lastActivityMs = System.currentTimeMillis();
-
-
     static final int CELL = 10;
     static final int GRID_W = 80;
     static final int GRID_H = 60;
@@ -23,8 +18,6 @@ final class Room {
 
     static final int SPAWN_R = 3;
     static final int ROOM_CAPACITY = 4;
-    static final int SPECTATOR_CAPACITY = 10;
-    static final int MAX_PLAYERS = 4;
 
     static final long CHAT_COOLDOWN_MS = 5_000;
     static final int CHAT_MAX_LEN = 300;
@@ -36,8 +29,6 @@ final class Room {
 
     final ConcurrentHashMap<String, PlayerEntity> players = new ConcurrentHashMap<>();
     final ConcurrentHashMap<Integer, String> idxToPlayerId = new ConcurrentHashMap<>();
-    final Set<ClientConn> spectators = ConcurrentHashMap.newKeySet();
-
 
     final Random rnd = new Random();
 
@@ -68,73 +59,54 @@ final class Room {
         }
     }
 
-
-    boolean isFullPlayers() {
-        return players.size() >= MAX_PLAYERS;
-    }
-
     void join(ClientConn c, boolean spectator) {
-        touch();
-    // leave old room (player or spectator)
-    if (c.roomId != null && !c.roomId.equals(roomId)) {
-        Room old = server.rooms.get(c.roomId);
-        if (old != null) {
-            if (c.spectator) old.removeSpectator(c);
-            else if (c.playerId != null) old.removePlayer(c.playerId, true);
-        }
-        c.playerId = null;
-    }
-
-    if (spectator) {
-        if (spectators.size() >= SPECTATOR_CAPACITY) {
-            c.sendJson(ServerMain.error("spectators_full"));
+        if (spectator) {
+            c.roomId = roomId;
+            c.spectator = true;
+            sendRoomJoined(c, true, null);
             return;
         }
-        spectators.add(c);
+
+        if (players.size() >= ROOM_CAPACITY) {
+            c.sendJson(ServerMain.error("room_full"));
+            return;
+        }
+
+        int idx = allocIdx();
+        if (idx < 0) {
+            c.sendJson(ServerMain.error("room_full"));
+            return;
+        }
+
+        // If switching rooms, remove old player
+        if (c.playerId != null && c.roomId != null) {
+            Room old = server.rooms.get(c.roomId);
+            if (old != null) old.removePlayer(c.playerId, true);
+        }
+
+        String pid = UUID.randomUUID().toString();
+        int sx = rnd.nextInt(GRID_W);
+        int sy = rnd.nextInt(GRID_H);
+
+        double px = sx * CELL + (CELL - PLAYER_SIZE) / 2.0;
+        double py = sy * CELL + (CELL - PLAYER_SIZE) / 2.0;
+
+        String color = ServerMain.pickColor(roomId, c.username);
+
+        PlayerEntity p = new PlayerEntity(c.userId, c.username, pid, idx, color, px, py, sx, sy);
+        players.put(pid, p);
+        idxToPlayerId.put(idx, pid);
+
+        c.playerId = pid;
         c.roomId = roomId;
-        c.spectator = true;
-        sendRoomJoined(c, true, null);
-        return;
+        c.spectator = false;
+
+        giveInitialTerritory(idx, sx, sy);
+
+        sendRoomJoined(c, false, pid);
     }
 
-    // switching from spectator to player in same room
-    if (c.spectator) {
-        removeSpectator(c);
-    }
-
-    if (players.size() >= ROOM_CAPACITY) {
-        c.sendJson(ServerMain.error("room_full"));
-        return;
-    }
-
-    int idx = allocIdx();
-    if (idx < 0) {
-        c.sendJson(ServerMain.error("room_full"));
-        return;
-    }
-
-    String pid = UUID.randomUUID().toString();
-    int sx = rnd.nextInt(GRID_W);
-    int sy = rnd.nextInt(GRID_H);
-
-    double px = sx * CELL + (CELL - PLAYER_SIZE) / 2.0;
-    double py = sy * CELL + (CELL - PLAYER_SIZE) / 2.0;
-
-    String color = ServerMain.pickColor(roomId, c.username);
-
-    PlayerEntity p = new PlayerEntity(c.userId, c.username, pid, idx, color, px, py, sx, sy);
-    players.put(pid, p);
-    idxToPlayerId.put(idx, pid);
-
-    c.playerId = pid;
-    c.roomId = roomId;
-    c.spectator = false;
-
-    giveInitialTerritory(idx, sx, sy);
-
-    sendRoomJoined(c, false, pid);
-}
-void sendRoomJoined(ClientConn c, boolean spectator, String pid) {
+    void sendRoomJoined(ClientConn c, boolean spectator, String pid) {
         ObjectNode msg = Net.MAPPER.createObjectNode();
         msg.put("type", "room_joined");
         msg.put("roomId", roomId);
@@ -142,17 +114,8 @@ void sendRoomJoined(ClientConn c, boolean spectator, String pid) {
         msg.put("spectator", spectator);
         if (pid != null) msg.put("playerId", pid);
         msg.put("players", players.size());
-        msg.put("spectators", spectators.size());
         c.sendJson(msg);
     }
-void removeSpectator(ClientConn c) {
-    if (c == null) return;
-    spectators.remove(c);
-    if (c.roomId != null && c.roomId.equals(roomId) && c.spectator) {
-        c.spectator = false;
-    }
-}
-
 
     void removePlayer(String playerId, boolean keepTerritory) {
         if (playerId == null) return;
@@ -161,7 +124,8 @@ void removeSpectator(ClientConn c) {
         idxToPlayerId.remove(p.idx);
         p.clearTrail();
 
-        server.recordResultAsync(p.userId, p.score);
+        try { server.db.recordResult(p.userId, p.score); }
+        catch (SQLException e) { System.err.println("[server] recordResult error: " + e.getMessage()); }
 
         if (!keepTerritory) {
             for (int i = 0; i < owners.length; i++) if (owners[i] == p.idx) owners[i] = 0;
@@ -169,7 +133,8 @@ void removeSpectator(ClientConn c) {
     }
 
     void killAndRespawn(PlayerEntity victim, String reason) {
-        server.recordResultAsync(victim.userId, victim.score);
+        try { server.db.recordResult(victim.userId, victim.score); }
+        catch (SQLException e) { System.err.println("[server] recordResult error: " + e.getMessage()); }
 
         for (int i = 0; i < owners.length; i++) if (owners[i] == victim.idx) owners[i] = 0;
         victim.clearTrail();
@@ -184,7 +149,8 @@ void removeSpectator(ClientConn c) {
 
         giveInitialTerritory(victim.idx, sx, sy);
         victim.deadCooldownTicks = 10;
-System.out.println("[server][" + roomId + "] " + victim.username + " died: " + reason);
+
+        System.out.println("[server][" + roomId + "] " + victim.username + " died: " + reason);
     }
 
     void step(double dt) {
@@ -219,7 +185,7 @@ System.out.println("[server][" + roomId + "] " + victim.username + " died: " + r
             if (other.idx == mover.idx) continue;
             if (other.deadCooldownTicks > 0) continue;
             if (other.trailSet.contains(ServerMain.key(x, y))) {
-                // mover killed 'other' by crossing their trail                killAndRespawn(other, "trail intersected by " + mover.username);
+                killAndRespawn(other, "trail intersected by " + mover.username);
             }
         }
 
@@ -229,7 +195,8 @@ System.out.println("[server][" + roomId + "] " + victim.username + " died: " + r
 
         if (!inOwnTerritory) {
             addTrail(mover, x, y);
-            // NOTE: closure is allowed only when returning to own territory (not by touching own trail)
+            // touches own trail => partial closure => capture
+            if (inOwnTrail && mover.trailList.size() >= 2) captureLoopOverwrite(mover);
         } else {
             if (!mover.trailList.isEmpty()) captureLoopOverwrite(mover);
         }
@@ -334,12 +301,5 @@ System.out.println("[server][" + roomId + "] " + victim.username + " died: " + r
         msg.put("ts", now);
 
         server.broadcastJsonToRoom(roomId, msg);
-    }
-
-
-    long lastActivityMs() { return lastActivityMs; }
-
-    boolean isCompletelyEmpty() {
-        return players.isEmpty() && spectators.isEmpty();
     }
 }

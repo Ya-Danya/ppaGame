@@ -4,7 +4,9 @@ import com.example.paperfx.common.Messages;
 
 import java.sql.*;
 import java.time.Instant;
-import java.util.*;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.UUID;
 
 public final class Db {
     private final String url;
@@ -43,10 +45,18 @@ public final class Db {
                 "  played_at TIMESTAMPTZ NOT NULL DEFAULT now()" +
                 ");"
             );
+
+            st.execute(
+                "CREATE TABLE IF NOT EXISTS achievements(" +
+                "  id BIGSERIAL PRIMARY KEY," +
+                "  user_id UUID NOT NULL REFERENCES app_users(id) ON DELETE CASCADE," +
+                "  code TEXT NOT NULL," +
+                "  unlocked_at TIMESTAMPTZ NOT NULL DEFAULT now()," +
+                "  UNIQUE(user_id, code)" +
+                ");"
+            );
         }
     }
-
-    // ---------------- auth ----------------
 
     public RegisterResult register(String username, String password) throws SQLException {
         username = normalize(username);
@@ -98,12 +108,8 @@ public final class Db {
         }
     }
 
-    // ---------------- results ----------------
-
     public void recordResult(String userId, int score) throws SQLException {
         UUID uid = UUID.fromString(userId);
-        score = Math.max(0, score);
-
         try (Connection c = get()) {
             c.setAutoCommit(false);
             try {
@@ -115,18 +121,13 @@ public final class Db {
                     ins.setTimestamp(3, Timestamp.from(Instant.now()));
                     ins.executeUpdate();
                 }
-
                 try (PreparedStatement upd = c.prepareStatement(
-                        "UPDATE app_users SET " +
-                        "  games_played = games_played + 1," +
-                        "  best_score = GREATEST(best_score, ?)" +
-                        "WHERE id = ?"
+                        "UPDATE app_users SET games_played = games_played + 1, best_score = GREATEST(best_score, ?) WHERE id = ?"
                 )) {
                     upd.setInt(1, score);
                     upd.setObject(2, uid);
                     upd.executeUpdate();
                 }
-
                 c.commit();
             } catch (SQLException e) {
                 c.rollback();
@@ -137,7 +138,6 @@ public final class Db {
         }
     }
 
-    // global leaderboard by best score
     public List<Messages.LeaderEntry> topBest(int limit) throws SQLException {
         limit = Math.max(1, Math.min(limit, 50));
         List<Messages.LeaderEntry> out = new ArrayList<>();

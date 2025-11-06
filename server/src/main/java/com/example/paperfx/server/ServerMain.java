@@ -21,18 +21,8 @@ public final class ServerMain {
     private final ServerSocket serverSocket;
 
     final CopyOnWriteArrayList<ClientConn> clients = new CopyOnWriteArrayList<>();
-
-    // 1 active session per username/userId
     final ConcurrentHashMap<String, ClientConn> activeByUsername = new ConcurrentHashMap<>();
-    final ConcurrentHashMap<String, ClientConn> activeByUserId = new ConcurrentHashMap<>();
-
     final ConcurrentHashMap<String, Room> rooms = new ConcurrentHashMap<>();
-
-    private final ExecutorService dbExec = Executors.newSingleThreadExecutor(r -> {
-        Thread t = new Thread(r, "db-writer");
-        t.setDaemon(true);
-        return t;
-    });
 
     private final AtomicLong tick = new AtomicLong(0);
     private final Random rnd = new Random();
@@ -136,12 +126,10 @@ public final class ServerMain {
         clients.remove(c);
 
         if (c.username != null) activeByUsername.remove(c.username, c);
-        if (c.userId != null) activeByUserId.remove(c.userId, c);
 
         if (c.roomId != null && c.playerId != null) {
             Room room = rooms.get(c.roomId);
-            if (room != null) if (c.spectator) room.removeSpectator(c);
-            else room.removePlayer(c.playerId, false);
+            if (room != null) room.removePlayer(c.playerId, false);
         }
 
         try { c.close(); } catch (Exception ignored) {}
@@ -186,22 +174,14 @@ public final class ServerMain {
         c.userId = r.userId();
         c.username = r.username();
 
-        activeByUserId.put(c.userId, c);
-
         try {
             c.send(Net.toJson(new Messages.AuthOk(c.userId, c.username, "", 0, pickColor("MAIN", c.username), r.bestScore())));
         } catch (JsonProcessingException e) {
             throw new RuntimeException(e);
         }
 
-        // Auto-join MAIN, but if MAIN is full for players -> move to a new room (only for non-spectators).
-        Room main = getOrCreateRoom("MAIN");
-        if (main.isFullPlayers() && !c.spectator) {
-            String newId = "R" + Integer.toHexString(Math.abs(rnd.nextInt()));
-            getOrCreateRoom(newId).join(c, false);
-        } else {
-            main.join(c, false);
-        }
+        // Auto-join MAIN
+        getOrCreateRoom("MAIN").join(c, false);
     }
 
     private void onInput(ClientConn c, JsonNode n) {
@@ -224,7 +204,7 @@ public final class ServerMain {
     private void onCreateRoom(ClientConn c, JsonNode n) {
         if (!c.authed) { c.sendJson(error("not_authenticated")); return; }
         String id = n.path("roomId").asText("");
-        if (id == null || id.isBlank()) id = "R" + Integer.toHexString(Math.abs(rnd.nextInt()));
+        if (id == null || id.isBlank()) id = "R" + Integer.toHexString(rnd.nextInt()).replace("-", "");
         getOrCreateRoom(id).join(c, false);
     }
 
@@ -243,18 +223,7 @@ public final class ServerMain {
         room.chatSend(c, text);
     }
 
-    
-    void recordResultAsync(String userId, int score) {
-        if (userId == null) return;
-        int s = Math.max(0, score);
-        dbExec.submit(() -> {
-            try { db.recordResult(userId, s); }
-            catch (SQLException e) { System.err.println("[server] recordResult error: " + e.getMessage()); }
-        });
-    }
-
     // ---- broadcasting ----
-
 
     void broadcastToRoom(String roomId, String jsonLine) {
         for (ClientConn c : clients) {
@@ -262,6 +231,12 @@ public final class ServerMain {
             if (!roomId.equals(c.roomId)) continue;
             c.send(jsonLine);
         }
+    }
+
+    void broadcastJsonToRoom(String roomId, ObjectNode msg) {
+        try {
+            broadcastToRoom(roomId, Net.MAPPER.writeValueAsString(msg));
+        } catch (Exception ignored) {}
     }
 
     // ---- utils ----
