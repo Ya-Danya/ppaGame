@@ -6,7 +6,7 @@ plugins {
 
 allprojects {
     group = "com.example"
-    version = "0.5.0"
+    version = "0.7.0"
     repositories { mavenCentral() }
 }
 
