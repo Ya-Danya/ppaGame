@@ -66,6 +66,9 @@ public final class PaperFxApp extends Application {
     private int desiredDy = 0;
     private long lastInputSentNs = 0;
 
+    // when false, ignore movement keys (e.g., when typing in chat)
+    private boolean gameControlEnabled = true;
+
     @Override
     public void start(Stage stage) {
         this.stage = stage;
@@ -143,6 +146,11 @@ public final class PaperFxApp extends Application {
 
     private void buildGameScene() {
         canvas = new Canvas(800, 600);
+        canvas.setFocusTraversable(true); // allow keyboard focus
+        canvas.setOnMousePressed(e -> {
+            gameControlEnabled = true;
+            canvas.requestFocus(); // click on game field returns control
+        });
 
         roomLabel = new Label("Room: MAIN");
         Label help = new Label("Move: WASD / Arrows | Chat: Q/E/R quick msgs, or type + Enter");
@@ -158,20 +166,57 @@ public final class PaperFxApp extends Application {
         leaderboard.setPrefHeight(250);
 
         // chat
-        chatView = new ListView<>(chatItems);
-        chatView.setPrefHeight(220);
+        chatView = new ListView<>();
+        chatView.setItems(chatItems);
+        chatView.setPrefHeight(250);
 
         chatInput = new TextField();
-        chatInput.setPromptText("Type message (<=300 chars) and press Enter");
+        chatInput.setPromptText("Type message + Enter");
         chatInput.setOnAction(e -> {
             String t = chatInput.getText();
             chatInput.clear();
             if (t != null && !t.isBlank()) sendChat(t.trim());
         });
 
+        // When focusing chat input, disable movement keys (and stop movement)
+        chatInput.focusedProperty().addListener((obs, was, isNow) -> {
+            if (isNow) {
+                gameControlEnabled = false;
+                pressed.clear();
+                desiredDx = 0;
+                desiredDy = 0;
+                sendInput(0, 0);
+            }
+        });
+
+        // Room controls
+        TextField roomIdField = new TextField();
+        roomIdField.setPromptText("Room id (optional)");
+
+        Button btnJoinRoom = new Button("Join");
+        btnJoinRoom.setMaxWidth(Double.MAX_VALUE);
+        btnJoinRoom.setOnAction(e -> sendJoinRoom(roomIdField.getText(), false));
+
+        Button btnCreateRoom = new Button("Create");
+        btnCreateRoom.setMaxWidth(Double.MAX_VALUE);
+        btnCreateRoom.setOnAction(e -> sendCreateRoom(roomIdField.getText()));
+
+        Button btnSpectate = new Button("Spectate");
+        btnSpectate.setMaxWidth(Double.MAX_VALUE);
+        btnSpectate.setOnAction(e -> sendJoinRoom(roomIdField.getText(), true));
+
+        HBox roomBtns = new HBox(8, btnJoinRoom, btnCreateRoom, btnSpectate);
+        roomBtns.setAlignment(Pos.CENTER);
+        HBox.setHgrow(btnJoinRoom, Priority.ALWAYS);
+        HBox.setHgrow(btnCreateRoom, Priority.ALWAYS);
+        HBox.setHgrow(btnSpectate, Priority.ALWAYS);
+
         VBox right = new VBox(10,
                 roomLabel,
                 help,
+                new Label("Rooms"),
+                roomIdField,
+                roomBtns,
                 new Label("Leaderboard"),
                 leaderboard,
                 new Label("Chat"),
@@ -179,7 +224,7 @@ public final class PaperFxApp extends Application {
                 chatInput
         );
         right.setPadding(new Insets(10));
-        right.setPrefWidth(280);
+        right.setPrefWidth(320);
 
         BorderPane root = new BorderPane();
         root.setCenter(new StackPane(canvas));
@@ -187,8 +232,10 @@ public final class PaperFxApp extends Application {
 
         gameScene = new Scene(root);
 
-        // Key events on whole scene
+        // Key events on whole scene (only when control is enabled)
         gameScene.setOnKeyPressed(e -> {
+            if (!gameControlEnabled) return;
+
             pressed.add(e.getCode());
 
             if (e.getCode() == KeyCode.Q) sendChat("Всем привет");
@@ -198,6 +245,8 @@ public final class PaperFxApp extends Application {
             recomputeDesiredDir();
         });
         gameScene.setOnKeyReleased(e -> {
+            if (!gameControlEnabled) return;
+
             pressed.remove(e.getCode());
             recomputeDesiredDir();
         });
@@ -208,6 +257,7 @@ public final class PaperFxApp extends Application {
             if (newW == null) return;
             newW.focusedProperty().addListener((o, was, isNow) -> {
                 if (!isNow) {
+                    gameControlEnabled = false;
                     pressed.clear();
                     desiredDx = 0;
                     desiredDy = 0;
@@ -226,7 +276,7 @@ public final class PaperFxApp extends Application {
                 pumpNetwork();
                 render();
 
-                if (now - lastInputSentNs > 33_000_000) { // ~30 Hz
+                if (gameControlEnabled && now - lastInputSentNs > 33_000_000) { // ~30 Hz
                     sendInput(desiredDx, desiredDy);
                     lastInputSentNs = now;
                 }
@@ -325,6 +375,24 @@ public final class PaperFxApp extends Application {
         sendJson(n);
     }
 
+
+    private void sendCreateRoom(String roomId) {
+        if (out == null) return;
+        ObjectNode n = Net.MAPPER.createObjectNode();
+        n.put("type", "create_room");
+        if (roomId != null) n.put("roomId", roomId.trim());
+        sendJson(n);
+    }
+
+    private void sendJoinRoom(String roomId, boolean spectator) {
+        if (out == null) return;
+        ObjectNode n = Net.MAPPER.createObjectNode();
+        n.put("type", "join_room");
+        if (roomId != null) n.put("roomId", roomId.trim());
+        n.put("spectator", spectator);
+        sendJson(n);
+    }
+
     private void pumpNetwork() {
         String line;
         int guard = 0;
@@ -339,11 +407,18 @@ public final class PaperFxApp extends Application {
                         Platform.runLater(() -> {
                             lblLoginStatus.setText("");
                             stage.setScene(gameScene);
+                            gameControlEnabled = true;
+                            if (canvas != null) canvas.requestFocus();
                         });
                     }
                     case "room_joined" -> {
-                        currentRoomId = n.path("roomId").asText("MAIN");
-                        Platform.runLater(() -> roomLabel.setText("Room: " + currentRoomId));
+                        String newRoom = n.path("roomId").asText("MAIN");
+                        boolean changed = !Objects.equals(currentRoomId, newRoom);
+                        currentRoomId = newRoom;
+                        Platform.runLater(() -> {
+                            roomLabel.setText("Room: " + currentRoomId);
+                            if (changed) chatItems.clear();
+                        });
                     }
                     case "state" -> {
                         Messages.State st = Net.MAPPER.treeToValue(n, Messages.State.class);

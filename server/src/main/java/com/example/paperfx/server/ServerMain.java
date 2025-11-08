@@ -27,6 +27,8 @@ public final class ServerMain {
     private final AtomicLong tick = new AtomicLong(0);
     private final Random rnd = new Random();
 
+    private final AtomicLong roomSeq = new AtomicLong(1);
+
     public static void main(String[] args) throws Exception {
         int port = args.length >= 1 ? Integer.parseInt(args[0]) : 7777;
 
@@ -70,9 +72,15 @@ public final class ServerMain {
             double dt = (now - lastNs[0]) / 1_000_000_000.0;
             lastNs[0] = now;
 
-            for (Room room : rooms.values()) room.step(dt);
+            // Snapshot to avoid concurrent modification when rooms are added/removed.
+            List<Room> snap = new ArrayList<>(rooms.values());
+
+            for (Room room : snap) room.step(dt);
             long t = tick.incrementAndGet();
-            for (Room room : rooms.values()) room.broadcastState(t);
+            for (Room room : snap) room.broadcastState(t);
+
+            // Periodic cleanup of empty rooms (keep MAIN forever).
+            if (t % 20 == 0) cleanupEmptyRooms();
         }, 0, periodMs, TimeUnit.MILLISECONDS);
 
         try { while (true) Thread.sleep(10_000); } catch (InterruptedException ignored) {}
@@ -127,9 +135,11 @@ public final class ServerMain {
 
         if (c.username != null) activeByUsername.remove(c.username, c);
 
-        if (c.roomId != null && c.playerId != null) {
+        if (c.roomId != null) {
             Room room = rooms.get(c.roomId);
-            if (room != null) room.removePlayer(c.playerId, false);
+            if (room != null && c.playerId != null) room.removePlayer(c.playerId, false);
+            // Remove empty rooms (except MAIN)
+            cleanupEmptyRooms();
         }
 
         try { c.close(); } catch (Exception ignored) {}
@@ -180,8 +190,50 @@ public final class ServerMain {
             throw new RuntimeException(e);
         }
 
-        // Auto-join MAIN
-        getOrCreateRoom("MAIN").join(c, false);
+        // Auto-join MAIN (or another non-full room; otherwise auto-create a new room)
+        Room main = getOrCreateRoom("MAIN");
+        if (main.players.size() < Room.ROOM_CAPACITY) {
+            main.join(c, false);
+        } else {
+            Room target = null;
+            for (Room room : rooms.values()) {
+                if ("MAIN".equals(room.roomId)) continue;
+                if (room.players.size() < Room.ROOM_CAPACITY) { target = room; break; }
+            }
+            if (target == null) target = getOrCreateRoom(newAutoRoomId());
+            target.join(c, false);
+        }
+    }
+
+    /**
+     * Generates a unique id for an auto-created room.
+     * Example: AUTO1, AUTO2, ...
+     */
+    private String newAutoRoomId() {
+        while (true) {
+            String id = "AUTO" + roomSeq.getAndIncrement();
+            if (id.length() > 32) id = id.substring(0, 32);
+            if (!rooms.containsKey(id)) return id;
+        }
+    }
+
+    /**
+     * Removes rooms that have no connected authenticated clients.
+     * MAIN is never removed.
+     */
+    private void cleanupEmptyRooms() {
+        // Determine which roomIds are currently occupied by any authenticated connection (players or spectators).
+        HashSet<String> occupied = new HashSet<>();
+        for (ClientConn c : clients) {
+            if (!c.authed) continue;
+            if (c.roomId == null) continue;
+            occupied.add(c.roomId);
+        }
+
+        for (String roomId : new ArrayList<>(rooms.keySet())) {
+            if ("MAIN".equals(roomId)) continue;
+            if (!occupied.contains(roomId)) rooms.remove(roomId);
+        }
     }
 
     private void onInput(ClientConn c, JsonNode n) {
@@ -206,6 +258,7 @@ public final class ServerMain {
         String id = n.path("roomId").asText("");
         if (id == null || id.isBlank()) id = "R" + Integer.toHexString(rnd.nextInt()).replace("-", "");
         getOrCreateRoom(id).join(c, false);
+        cleanupEmptyRooms();
     }
 
     private void onJoinRoom(ClientConn c, JsonNode n) {
@@ -213,6 +266,7 @@ public final class ServerMain {
         String id = n.path("roomId").asText("");
         boolean spectator = n.path("spectator").asBoolean(false);
         getOrCreateRoom(id).join(c, spectator);
+        cleanupEmptyRooms();
     }
 
     private void onChatSend(ClientConn c, JsonNode n) {

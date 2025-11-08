@@ -81,7 +81,7 @@ final class Room {
         // If switching rooms, remove old player
         if (c.playerId != null && c.roomId != null) {
             Room old = server.rooms.get(c.roomId);
-            if (old != null) old.removePlayer(c.playerId, true);
+            if (old != null) old.removePlayer(c.playerId, false);
         }
 
         String pid = UUID.randomUUID().toString();
