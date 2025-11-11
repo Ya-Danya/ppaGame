@@ -53,6 +53,11 @@ public final class PaperFxApp extends Application {
     private Label roomLabel;
     private TableView<LeaderRow> leaderboard;
 
+    private TextField roomIdField;
+    private Button btnSpectatePlay;
+
+    private volatile boolean isSpectator = false;
+
     // ---- state ----
     private volatile Messages.State lastState;
     private volatile String myUsername = "";
@@ -144,43 +149,123 @@ public final class PaperFxApp extends Application {
         loginScene = new Scene(root);
     }
 
-    private void buildGameScene() {
-        canvas = new Canvas(800, 600);
-        canvas.setFocusTraversable(true); // allow keyboard focus
-        canvas.setOnMousePressed(e -> {
-            gameControlEnabled = true;
-            canvas.requestFocus(); // click on game field returns control
-        });
+private void buildGameScene() {
+    canvas = new Canvas(800, 600);
+    canvas.setFocusTraversable(true); // allow keyboard focus
+    canvas.setOnMousePressed(e -> {
+        canvas.requestFocus(); // click on game field returns focus
+        if (!isSpectator) gameControlEnabled = true; // spectators can't regain control
+    });
 
-        roomLabel = new Label("Room: MAIN");
-        Label help = new Label("Move: WASD / Arrows | Chat: Q/E/R quick msgs, or type + Enter");
+    roomLabel = new Label("Room: MAIN");
+    Label help = new Label("Move: WASD / Arrows | Chat: Q/E/R quick msgs, or type + Enter");
 
-        // leaderboard table
-        leaderboard = new TableView<>();
-        leaderboard.setColumnResizePolicy(TableView.CONSTRAINED_RESIZE_POLICY_ALL_COLUMNS);
-        TableColumn<LeaderRow, String> colName = new TableColumn<>("User");
-        colName.setCellValueFactory(c -> c.getValue().usernameProperty());
-        TableColumn<LeaderRow, Number> colScore = new TableColumn<>("Score");
-        colScore.setCellValueFactory(c -> c.getValue().scoreProperty());
-        leaderboard.getColumns().addAll(colName, colScore);
-        leaderboard.setPrefHeight(250);
+    // leaderboard table
+    leaderboard = new TableView<>();
+    leaderboard.setColumnResizePolicy(TableView.CONSTRAINED_RESIZE_POLICY_ALL_COLUMNS);
+    TableColumn<LeaderRow, String> colName = new TableColumn<>("User");
+    colName.setCellValueFactory(c -> c.getValue().usernameProperty());
+    TableColumn<LeaderRow, Number> colScore = new TableColumn<>("Score");
+    colScore.setCellValueFactory(c -> c.getValue().scoreProperty());
+    leaderboard.getColumns().addAll(colName, colScore);
+    leaderboard.setPrefHeight(250);
 
-        // chat
-        chatView = new ListView<>();
-        chatView.setItems(chatItems);
-        chatView.setPrefHeight(250);
+    // chat
+    chatView = new ListView<>();
+    chatView.setItems(chatItems);
+    chatView.setPrefHeight(250);
 
-        chatInput = new TextField();
-        chatInput.setPromptText("Type message + Enter");
-        chatInput.setOnAction(e -> {
-            String t = chatInput.getText();
-            chatInput.clear();
-            if (t != null && !t.isBlank()) sendChat(t.trim());
-        });
+    chatInput = new TextField();
+    chatInput.setPromptText("Type message + Enter");
+    chatInput.setOnAction(e -> {
+        String t = chatInput.getText();
+        chatInput.clear();
+        if (t != null && !t.isBlank()) sendChat(t.trim());
+    });
 
-        // When focusing chat input, disable movement keys (and stop movement)
-        chatInput.focusedProperty().addListener((obs, was, isNow) -> {
-            if (isNow) {
+    // When focusing chat input, disable movement keys (and stop movement)
+    chatInput.focusedProperty().addListener((obs, was, isNow) -> {
+        if (isNow) {
+            gameControlEnabled = false;
+            pressed.clear();
+            desiredDx = 0;
+            desiredDy = 0;
+            sendInput(0, 0);
+        }
+    });
+
+    // Room controls
+    roomIdField = new TextField();
+    roomIdField.setPromptText("Room id (optional)");
+
+    Button btnJoinRoom = new Button("Join");
+    btnJoinRoom.setMaxWidth(Double.MAX_VALUE);
+    btnJoinRoom.setOnAction(e -> sendJoinRoom(resolveRoomId(roomIdField.getText()), false));
+
+    Button btnCreateRoom = new Button("Create");
+    btnCreateRoom.setMaxWidth(Double.MAX_VALUE);
+    btnCreateRoom.setOnAction(e -> sendCreateRoom(roomIdField.getText()));
+
+    btnSpectatePlay = new Button("Spectate");
+    btnSpectatePlay.setMaxWidth(Double.MAX_VALUE);
+    btnSpectatePlay.setOnAction(e -> {
+        String rid = resolveRoomId(roomIdField.getText());
+        if (isSpectator) sendJoinRoom(rid, false); // play
+        else sendJoinRoom(rid, true); // spectate
+    });
+
+    HBox roomBtns = new HBox(8, btnJoinRoom, btnCreateRoom, btnSpectatePlay);
+    roomBtns.setAlignment(Pos.CENTER);
+    HBox.setHgrow(btnJoinRoom, Priority.ALWAYS);
+    HBox.setHgrow(btnCreateRoom, Priority.ALWAYS);
+    HBox.setHgrow(btnSpectatePlay, Priority.ALWAYS);
+
+    VBox right = new VBox(10,
+            roomLabel,
+            help,
+            new Label("Rooms"),
+            roomIdField,
+            roomBtns,
+            new Label("Leaderboard"),
+            leaderboard,
+            new Label("Chat"),
+            chatView,
+            chatInput
+    );
+    right.setPadding(new Insets(10));
+    right.setPrefWidth(320);
+
+    BorderPane root = new BorderPane();
+    root.setCenter(new StackPane(canvas));
+    root.setRight(right);
+
+    gameScene = new Scene(root);
+
+    // Key events on whole scene (only when control is enabled)
+    gameScene.setOnKeyPressed(e -> {
+        if (!gameControlEnabled) return;
+
+        pressed.add(e.getCode());
+
+        if (e.getCode() == KeyCode.Q) sendChat("Всем привет");
+        if (e.getCode() == KeyCode.E) sendChat("Вхавха");
+        if (e.getCode() == KeyCode.R) sendChat("Рачки))");
+
+        recomputeDesiredDir();
+    });
+    gameScene.setOnKeyReleased(e -> {
+        if (!gameControlEnabled) return;
+
+        pressed.remove(e.getCode());
+        recomputeDesiredDir();
+    });
+
+    // IMPORTANT: gameScene.getWindow() is null until the scene is set on a Stage.
+    // Attach focus listener when the window becomes available.
+    gameScene.windowProperty().addListener((obs, oldW, newW) -> {
+        if (newW == null) return;
+        newW.focusedProperty().addListener((o, was, isNow) -> {
+            if (!isNow) {
                 gameControlEnabled = false;
                 pressed.clear();
                 desiredDx = 0;
@@ -188,102 +273,26 @@ public final class PaperFxApp extends Application {
                 sendInput(0, 0);
             }
         });
+    });
 
-        // Room controls
-        TextField roomIdField = new TextField();
-        roomIdField.setPromptText("Room id (optional)");
+    // render + network pump
+    AnimationTimer timer = new AnimationTimer() {
+        long last = 0;
+        @Override public void handle(long now) {
+            if (last == 0) last = now;
+            last = now;
 
-        Button btnJoinRoom = new Button("Join");
-        btnJoinRoom.setMaxWidth(Double.MAX_VALUE);
-        btnJoinRoom.setOnAction(e -> sendJoinRoom(roomIdField.getText(), false));
+            pumpNetwork();
+            render();
 
-        Button btnCreateRoom = new Button("Create");
-        btnCreateRoom.setMaxWidth(Double.MAX_VALUE);
-        btnCreateRoom.setOnAction(e -> sendCreateRoom(roomIdField.getText()));
-
-        Button btnSpectate = new Button("Spectate");
-        btnSpectate.setMaxWidth(Double.MAX_VALUE);
-        btnSpectate.setOnAction(e -> sendJoinRoom(roomIdField.getText(), true));
-
-        HBox roomBtns = new HBox(8, btnJoinRoom, btnCreateRoom, btnSpectate);
-        roomBtns.setAlignment(Pos.CENTER);
-        HBox.setHgrow(btnJoinRoom, Priority.ALWAYS);
-        HBox.setHgrow(btnCreateRoom, Priority.ALWAYS);
-        HBox.setHgrow(btnSpectate, Priority.ALWAYS);
-
-        VBox right = new VBox(10,
-                roomLabel,
-                help,
-                new Label("Rooms"),
-                roomIdField,
-                roomBtns,
-                new Label("Leaderboard"),
-                leaderboard,
-                new Label("Chat"),
-                chatView,
-                chatInput
-        );
-        right.setPadding(new Insets(10));
-        right.setPrefWidth(320);
-
-        BorderPane root = new BorderPane();
-        root.setCenter(new StackPane(canvas));
-        root.setRight(right);
-
-        gameScene = new Scene(root);
-
-        // Key events on whole scene (only when control is enabled)
-        gameScene.setOnKeyPressed(e -> {
-            if (!gameControlEnabled) return;
-
-            pressed.add(e.getCode());
-
-            if (e.getCode() == KeyCode.Q) sendChat("Всем привет");
-            if (e.getCode() == KeyCode.E) sendChat("Вхавха");
-            if (e.getCode() == KeyCode.R) sendChat("Рачки))");
-
-            recomputeDesiredDir();
-        });
-        gameScene.setOnKeyReleased(e -> {
-            if (!gameControlEnabled) return;
-
-            pressed.remove(e.getCode());
-            recomputeDesiredDir();
-        });
-
-        // IMPORTANT: gameScene.getWindow() is null until the scene is set on a Stage.
-        // Attach focus listener when the window becomes available.
-        gameScene.windowProperty().addListener((obs, oldW, newW) -> {
-            if (newW == null) return;
-            newW.focusedProperty().addListener((o, was, isNow) -> {
-                if (!isNow) {
-                    gameControlEnabled = false;
-                    pressed.clear();
-                    desiredDx = 0;
-                    desiredDy = 0;
-                    sendInput(0, 0);
-                }
-            });
-        });
-
-        // render + network pump
-        AnimationTimer timer = new AnimationTimer() {
-            long last = 0;
-            @Override public void handle(long now) {
-                if (last == 0) last = now;
-                last = now;
-
-                pumpNetwork();
-                render();
-
-                if (gameControlEnabled && now - lastInputSentNs > 33_000_000) { // ~30 Hz
-                    sendInput(desiredDx, desiredDy);
-                    lastInputSentNs = now;
-                }
+            if (gameControlEnabled && now - lastInputSentNs > 33_000_000) { // ~30 Hz
+                sendInput(desiredDx, desiredDy);
+                lastInputSentNs = now;
             }
-        };
-        timer.start();
-    }
+        }
+    };
+    timer.start();
+}
 
     private void recomputeDesiredDir() {
         int dx = 0, dy = 0;
@@ -376,22 +385,30 @@ public final class PaperFxApp extends Application {
     }
 
 
-    private void sendCreateRoom(String roomId) {
-        if (out == null) return;
-        ObjectNode n = Net.MAPPER.createObjectNode();
-        n.put("type", "create_room");
-        if (roomId != null) n.put("roomId", roomId.trim());
-        sendJson(n);
+    private String resolveRoomId(String typed) {
+        String t = (typed == null) ? "" : typed.trim();
+        if (!t.isEmpty()) return t;
+        String cur = (currentRoomId == null) ? "" : currentRoomId.trim();
+        return cur.isEmpty() ? "MAIN" : cur;
     }
 
-    private void sendJoinRoom(String roomId, boolean spectator) {
-        if (out == null) return;
-        ObjectNode n = Net.MAPPER.createObjectNode();
-        n.put("type", "join_room");
-        if (roomId != null) n.put("roomId", roomId.trim());
-        n.put("spectator", spectator);
-        sendJson(n);
-    }
+
+private void sendCreateRoom(String roomId) {
+    if (out == null) return;
+    ObjectNode n = Net.MAPPER.createObjectNode();
+    n.put("type", "create_room");
+    if (roomId != null) n.put("roomId", roomId.trim());
+    sendJson(n);
+}
+
+private void sendJoinRoom(String roomId, boolean spectator) {
+    if (out == null) return;
+    ObjectNode n = Net.MAPPER.createObjectNode();
+    n.put("type", "join_room");
+    if (roomId != null) n.put("roomId", roomId.trim());
+    n.put("spectator", spectator);
+    sendJson(n);
+}
 
     private void pumpNetwork() {
         String line;
@@ -413,13 +430,34 @@ public final class PaperFxApp extends Application {
                     }
                     case "room_joined" -> {
                         String newRoom = n.path("roomId").asText("MAIN");
-                        boolean changed = !Objects.equals(currentRoomId, newRoom);
+                        boolean spectator = n.path("spectator").asBoolean(false);
+
+                        boolean roomChanged = !Objects.equals(currentRoomId, newRoom);
                         currentRoomId = newRoom;
+                        isSpectator = spectator;
+
+                        if (spectator) {
+                            // spectators must not control movement
+                            gameControlEnabled = false;
+                            pressed.clear();
+                            desiredDx = 0;
+                            desiredDy = 0;
+                            sendInput(0, 0);
+                        }
+
                         Platform.runLater(() -> {
                             roomLabel.setText("Room: " + currentRoomId);
-                            if (changed) chatItems.clear();
+                            if (roomChanged) chatItems.clear();
+
+                            if (btnSpectatePlay != null) {
+                                btnSpectatePlay.setText(isSpectator ? "Play" : "Spectate");
+                            }
+
+                            // For players, allow regaining control by clicking the field.
+                            if (!isSpectator && canvas != null) canvas.requestFocus();
                         });
                     }
+
                     case "state" -> {
                         Messages.State st = Net.MAPPER.treeToValue(n, Messages.State.class);
                         lastState = st;
@@ -430,6 +468,9 @@ public final class PaperFxApp extends Application {
                         });
                     }
                     case "chat_msg" -> {
+                        String rid = n.path("roomId").asText("");
+                        if (rid != null && !rid.isBlank() && !rid.equals(currentRoomId)) break;
+
                         String from = n.path("from").asText("?");
                         String text = n.path("text").asText("");
                         Platform.runLater(() -> {
@@ -477,12 +518,28 @@ public final class PaperFxApp extends Application {
             canvas.setHeight(targetH);
         }
 
+        // Build idx -> color mapping from players in this room (territory color must match player color)
+        HashMap<Integer, Color> idxToColor = new HashMap<>();
+        if (st.players != null) {
+            for (Messages.Player p : st.players) {
+                if (p.color == null || p.color.isBlank()) continue;
+                try {
+                    idxToColor.put(p.idx, Color.web(p.color));
+                } catch (Exception ignored) {}
+            }
+        }
+
         // territory
         for (int y = 0; y < gh; y++) {
             for (int x = 0; x < gw; x++) {
                 int idx = st.owners[y * gw + x];
                 if (idx == 0) continue;
-                Color c = Color.hsb((idx * 70) % 360, 0.65, 0.75, 0.65);
+
+                Color base = idxToColor.get(idx);
+                Color c = (base != null)
+                        ? base.deriveColor(0, 1, 1, 0.65)
+                        : Color.hsb((idx * 70) % 360, 0.65, 0.75, 0.65);
+
                 g.setFill(c);
                 g.fillRect(x * cell, y * cell, cell, cell);
             }
@@ -497,6 +554,10 @@ public final class PaperFxApp extends Application {
                         g.fillRect(c.x * cell, c.y * cell, cell, cell);
                     }
                 }
+
+                // small shadow
+                g.setFill(Color.color(0, 0, 0, 0.30));
+                g.fillOval(p.x + 2, p.y + 2, 16, 16);
 
                 Color pc = Color.web(p.color == null ? "#FFFFFF" : p.color);
                 g.setFill(pc);
