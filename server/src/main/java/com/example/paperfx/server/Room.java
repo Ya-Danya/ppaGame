@@ -61,6 +61,12 @@ final class Room {
 
     void join(ClientConn c, boolean spectator) {
         if (spectator) {
+            // If switching rooms, remove old player first (spectators must be invisible on field)
+            if (c.playerId != null && c.roomId != null) {
+                Room old = server.rooms.get(c.roomId);
+                if (old != null) old.removePlayer(c.playerId, false);
+            }
+            c.playerId = null;
             c.roomId = roomId;
             c.spectator = true;
             sendRoomJoined(c, true, null);
@@ -191,13 +197,12 @@ final class Room {
 
         int idx = mover.idx;
         boolean inOwnTerritory = owners[toIndex(x, y)] == idx;
-        boolean inOwnTrail = mover.trailSet.contains(ServerMain.key(x, y));
 
         if (!inOwnTerritory) {
+            // Outside of own territory: extend trail. Capturing is allowed ONLY when returning to owned territory.
             addTrail(mover, x, y);
-            // touches own trail => partial closure => capture
-            if (inOwnTrail && mover.trailList.size() >= 2) captureLoopOverwrite(mover);
         } else {
+            // Returning to own territory closes the loop and captures the enclosed area.
             if (!mover.trailList.isEmpty()) captureLoopOverwrite(mover);
         }
     }
