@@ -55,6 +55,18 @@ public final class Db {
                 "  UNIQUE(user_id, code)" +
                 ");"
             );
+
+            st.execute(
+                "CREATE TABLE IF NOT EXISTS user_stats(" +
+                "  user_id UUID PRIMARY KEY REFERENCES app_users(id) ON DELETE CASCADE," +
+                "  kills_total BIGINT NOT NULL DEFAULT 0," +
+                "  area_total BIGINT NOT NULL DEFAULT 0," +
+                "  best_kills_in_game INT NOT NULL DEFAULT 0," +
+                "  best_kill_streak INT NOT NULL DEFAULT 0," +
+                "  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()" +
+                ");"
+            );
+
         }
     }
 
@@ -153,7 +165,91 @@ public final class Db {
         return out;
     }
 
-    private static String normalize(String s) { return s == null ? "" : s.trim(); }
+    
+
+    public UserStats loadOrCreateStats(String userId) throws SQLException {
+        UUID uid = UUID.fromString(userId);
+        try (Connection c = get()) {
+            try (PreparedStatement ins = c.prepareStatement(
+                    "INSERT INTO user_stats(user_id) VALUES (?) ON CONFLICT (user_id) DO NOTHING"
+            )) {
+                ins.setObject(1, uid);
+                ins.executeUpdate();
+            }
+            try (PreparedStatement ps = c.prepareStatement(
+                    "SELECT kills_total, area_total, best_kills_in_game, best_kill_streak FROM user_stats WHERE user_id = ?"
+            )) {
+                ps.setObject(1, uid);
+                try (ResultSet rs = ps.executeQuery()) {
+                    if (!rs.next()) return new UserStats(0, 0, 0, 0);
+                    return new UserStats(
+                            rs.getLong("kills_total"),
+                            rs.getLong("area_total"),
+                            rs.getInt("best_kills_in_game"),
+                            rs.getInt("best_kill_streak")
+                    );
+                }
+            }
+        }
+    }
+
+    /**
+     * Applies batched stat deltas. This is designed for infrequent flushes.
+     * - kills_total and area_total are incremented by deltas.
+     * - best_* are updated using GREATEST.
+     */
+    public void applyStats(String userId, long addKills, long addArea, int bestKillsInGameCandidate, int bestKillStreakCandidate) throws SQLException {
+        UUID uid = UUID.fromString(userId);
+        try (Connection c = get();
+             PreparedStatement ps = c.prepareStatement(
+                     "INSERT INTO user_stats(user_id, kills_total, area_total, best_kills_in_game, best_kill_streak, updated_at) " +
+                     "VALUES (?, ?, ?, ?, ?, now()) " +
+                     "ON CONFLICT (user_id) DO UPDATE SET " +
+                     "  kills_total = user_stats.kills_total + EXCLUDED.kills_total, " +
+                     "  area_total = user_stats.area_total + EXCLUDED.area_total, " +
+                     "  best_kills_in_game = GREATEST(user_stats.best_kills_in_game, EXCLUDED.best_kills_in_game), " +
+                     "  best_kill_streak = GREATEST(user_stats.best_kill_streak, EXCLUDED.best_kill_streak), " +
+                     "  updated_at = now()"
+             )) {
+            ps.setObject(1, uid);
+            ps.setLong(2, Math.max(0, addKills));
+            ps.setLong(3, Math.max(0, addArea));
+            ps.setInt(4, Math.max(0, bestKillsInGameCandidate));
+            ps.setInt(5, Math.max(0, bestKillStreakCandidate));
+            ps.executeUpdate();
+        }
+    }
+
+    public boolean unlockAchievement(String userId, String code) throws SQLException {
+        UUID uid = UUID.fromString(userId);
+        try (Connection c = get();
+             PreparedStatement ps = c.prepareStatement(
+                     "INSERT INTO achievements(user_id, code) VALUES (?, ?) ON CONFLICT (user_id, code) DO NOTHING"
+             )) {
+            ps.setObject(1, uid);
+            ps.setString(2, code);
+            int updated = ps.executeUpdate();
+            return updated > 0;
+        }
+    }
+
+    public List<String> listAchievementCodes(String userId) throws SQLException {
+        UUID uid = UUID.fromString(userId);
+        List<String> out = new ArrayList<>();
+        try (Connection c = get();
+             PreparedStatement ps = c.prepareStatement(
+                     "SELECT code FROM achievements WHERE user_id = ? ORDER BY unlocked_at ASC"
+             )) {
+            ps.setObject(1, uid);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) out.add(rs.getString("code"));
+            }
+        }
+        return out;
+    }
+
+    public record UserStats(long kills, long area, int bestKillsInGame, int bestKillStreak) {}
+private static String normalize(String s) { return s == null ? "" : s.trim(); }
 
     public record RegisterResult(boolean ok, String userId, String username, int bestScore, String error) {
         public static RegisterResult ok(String id, String u, int best) { return new RegisterResult(true, id, u, best, null); }

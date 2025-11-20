@@ -23,6 +23,32 @@ final class ClientConn implements Closeable {
 
     volatile long lastChatMs = 0;
 
+    // ---- persistent profile/stats cache (loaded on login) ----
+    // All-time totals (from DB, plus in-memory pending deltas)
+    volatile long killsTotal = 0;
+    volatile long areaTotal = 0;
+
+    // Best values (cached from DB / session)
+    volatile int bestScore = 0;          // max score ever (best_score in app_users)
+    volatile int bestKillsInGame = 0;    // max kills in a single game/session
+    volatile int bestKillStreak = 0;     // max kill streak ever
+
+    // Pending deltas to flush to DB (batched)
+    volatile long pendingKills = 0;
+    volatile long pendingArea = 0;
+    volatile boolean statsDirty = false;
+
+    // Current session (since last join as a player)
+    volatile int sessionKills = 0;
+    volatile int currentKillStreak = 0;
+    volatile int sessionMaxKillStreak = 0;
+    volatile int sessionMaxScore = 0;
+
+    // Achievement cache (to avoid extra DB writes)
+    final java.util.Set<String> unlockedAchievements = java.util.concurrent.ConcurrentHashMap.newKeySet();
+
+    volatile long lastStatsFlushMs = 0;
+
     ClientConn(ServerMain server, Socket socket) throws IOException {
         this.server = server;
         this.socket = socket;

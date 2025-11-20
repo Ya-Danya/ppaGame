@@ -11,6 +11,7 @@ final class PlayerEntity {
     final String playerId;
     final int idx;
     final String color;
+    final ClientConn conn;
 
     double x, y;
     int inputDx = 0, inputDy = 0;
@@ -22,13 +23,14 @@ final class PlayerEntity {
     final HashSet<Long> trailSet = new HashSet<>();
     final ArrayList<Messages.Cell> trailList = new ArrayList<>();
 
-    PlayerEntity(String userId, String username, String playerId, int idx, String color,
+    PlayerEntity(String userId, String username, String playerId, int idx, String color, ClientConn conn,
                  double x, double y, int cellX, int cellY) {
         this.userId = userId;
         this.username = username;
         this.playerId = playerId;
         this.idx = idx;
         this.color = color;
+        this.conn = conn;
         this.x = x;
         this.y = y;
         this.cellX = cellX;

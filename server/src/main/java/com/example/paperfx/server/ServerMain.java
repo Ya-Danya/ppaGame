@@ -29,6 +29,40 @@ public final class ServerMain {
 
     private final AtomicLong roomSeq = new AtomicLong(1);
 
+    // ---- achievements ----
+    enum AchMetric { TOTAL_KILLS, TOTAL_AREA, BEST_SCORE, BEST_KILLS_IN_GAME, BEST_KILL_STREAK }
+
+    record AchievementDef(String code, String title, String desc, AchMetric metric, long threshold) {}
+
+    private static final List<AchievementDef> ACHIEVEMENTS = List.of(
+            new AchievementDef("KILLS_1", "First Blood", "Kill 1 player in total.", AchMetric.TOTAL_KILLS, 1),
+            new AchievementDef("KILLS_10", "Hunter", "Kill 10 players in total.", AchMetric.TOTAL_KILLS, 10),
+            new AchievementDef("KILLS_50", "Predator", "Kill 50 players in total.", AchMetric.TOTAL_KILLS, 50),
+
+            new AchievementDef("AREA_100", "Pioneer", "Capture 100 cells in total.", AchMetric.TOTAL_AREA, 100),
+            new AchievementDef("AREA_1000", "Conqueror", "Capture 1,000 cells in total.", AchMetric.TOTAL_AREA, 1000),
+            new AchievementDef("AREA_5000", "Empire", "Capture 5,000 cells in total.", AchMetric.TOTAL_AREA, 5000),
+
+            new AchievementDef("SCORE_100", "Getting Started", "Reach score 100.", AchMetric.BEST_SCORE, 100),
+            new AchievementDef("SCORE_500", "Big Player", "Reach score 500.", AchMetric.BEST_SCORE, 500),
+            new AchievementDef("SCORE_1000", "Unstoppable", "Reach score 1000.", AchMetric.BEST_SCORE, 1000),
+
+            new AchievementDef("KILLS_GAME_3", "Rampage", "Kill 3 players in a single game.", AchMetric.BEST_KILLS_IN_GAME, 3),
+            new AchievementDef("KILLS_GAME_5", "Slayer", "Kill 5 players in a single game.", AchMetric.BEST_KILLS_IN_GAME, 5),
+
+            new AchievementDef("STREAK_3", "Killing Spree", "Achieve a 3 kill streak.", AchMetric.BEST_KILL_STREAK, 3),
+            new AchievementDef("STREAK_5", "Dominating", "Achieve a 5 kill streak.", AchMetric.BEST_KILL_STREAK, 5)
+    );
+
+    private static final Map<String, AchievementDef> ACH_BY_CODE;
+    static {
+        Map<String, AchievementDef> m = new HashMap<>();
+        for (AchievementDef d : ACHIEVEMENTS) m.put(d.code(), d);
+        ACH_BY_CODE = Collections.unmodifiableMap(m);
+    }
+
+    private static final long STATS_FLUSH_INTERVAL_MS = 30_000;
+
     public static void main(String[] args) throws Exception {
         int port = args.length >= 1 ? Integer.parseInt(args[0]) : 7777;
 
@@ -81,6 +115,8 @@ public final class ServerMain {
 
             // Periodic cleanup of empty rooms (keep MAIN forever).
             if (t % 20 == 0) cleanupEmptyRooms();
+            if (t % 600 == 0) flushAllUserStats(false);
+
         }, 0, periodMs, TimeUnit.MILLISECONDS);
 
         try { while (true) Thread.sleep(10_000); } catch (InterruptedException ignored) {}
@@ -122,6 +158,7 @@ public final class ServerMain {
                 case "create_room" -> onCreateRoom(c, n);
                 case "join_room" -> onJoinRoom(c, n);
                 case "chat_send" -> onChatSend(c, n);
+                case "profile_get" -> onProfileGet(c);
                 case "ping" -> { /* keepalive */ }
                 default -> c.sendJson(error("unknown_message"));
             }
@@ -132,6 +169,9 @@ public final class ServerMain {
 
     void onDisconnected(ClientConn c) {
         clients.remove(c);
+
+        // Flush any pending stats for spectators / disconnected clients.
+        flushUserStats(c, true);
 
         if (c.username != null) activeByUsername.remove(c.username, c);
 
@@ -183,6 +223,22 @@ public final class ServerMain {
         c.authed = true;
         c.userId = r.userId();
         c.username = r.username();
+
+        c.bestScore = r.bestScore();
+        try {
+            Db.UserStats st = db.loadOrCreateStats(c.userId);
+            c.killsTotal = st.kills();
+            c.areaTotal = st.area();
+            c.bestKillsInGame = st.bestKillsInGame();
+            c.bestKillStreak = st.bestKillStreak();
+            c.unlockedAchievements.clear();
+            c.unlockedAchievements.addAll(db.listAchievementCodes(c.userId));
+            c.lastStatsFlushMs = System.currentTimeMillis();
+            c.statsDirty = false;
+        } catch (SQLException e) {
+            System.err.println("[server] load stats error: " + e.getMessage());
+        }
+
 
         try {
             c.send(Net.toJson(new Messages.AuthOk(c.userId, c.username, "", 0, pickColor("MAIN", c.username), r.bestScore())));
@@ -275,6 +331,125 @@ public final class ServerMain {
         if (room == null) return;
         String text = n.path("text").asText("");
         room.chatSend(c, text);
+    }
+
+    private void onProfileGet(ClientConn c) {
+        if (!c.authed) { c.sendJson(error("not_authenticated")); return; }
+
+        // Do not force-flush on every profile open; just show projected values including pending deltas.
+        ObjectNode msg = Net.MAPPER.createObjectNode();
+        msg.put("type", "profile");
+        msg.put("username", c.username);
+
+        ObjectNode stats = msg.putObject("stats");
+        stats.put("kills", c.killsTotal + c.pendingKills);
+        stats.put("area", c.areaTotal + c.pendingArea);
+        stats.put("bestScore", Math.max(c.bestScore, c.sessionMaxScore));
+        stats.put("bestKillsInGame", Math.max(c.bestKillsInGame, c.sessionKills));
+        stats.put("bestKillStreak", Math.max(c.bestKillStreak, c.sessionMaxKillStreak));
+
+        com.fasterxml.jackson.databind.node.ArrayNode arr = msg.putArray("achievements");
+        ArrayList<String> codes = new ArrayList<>(c.unlockedAchievements);
+        Collections.sort(codes);
+        for (String code : codes) {
+            ObjectNode a = Net.MAPPER.createObjectNode();
+            a.put("code", code);
+            AchievementDef d = ACH_BY_CODE.get(code);
+            if (d != null) {
+                a.put("title", d.title());
+                a.put("desc", d.desc());
+            }
+            arr.add(a);
+        }
+
+        c.sendJson(msg);
+    }
+
+
+    void resetSession(ClientConn c) {
+        if (c == null) return;
+        c.sessionKills = 0;
+        c.currentKillStreak = 0;
+        c.sessionMaxKillStreak = 0;
+        c.sessionMaxScore = 0;
+    }
+
+    void flushAllUserStats(boolean force) {
+        for (ClientConn c : clients) flushUserStats(c, force);
+    }
+
+    void flushUserStats(ClientConn c, boolean force) {
+        if (c == null || !c.authed) return;
+
+        long now = System.currentTimeMillis();
+        if (!force) {
+            if (!c.statsDirty) return;
+            if (now - c.lastStatsFlushMs < STATS_FLUSH_INTERVAL_MS) return;
+        }
+
+        long addKills = c.pendingKills;
+        long addArea = c.pendingArea;
+        int candBestKillsInGame = Math.max(c.bestKillsInGame, c.sessionKills);
+        int candBestKillStreak = Math.max(c.bestKillStreak, c.sessionMaxKillStreak);
+
+        // Nothing to write
+        if (!force && addKills == 0 && addArea == 0 &&
+                candBestKillsInGame == c.bestKillsInGame &&
+                candBestKillStreak == c.bestKillStreak) {
+            c.statsDirty = false;
+            c.lastStatsFlushMs = now;
+            return;
+        }
+
+        try {
+            db.applyStats(c.userId, addKills, addArea, candBestKillsInGame, candBestKillStreak);
+            c.killsTotal += addKills;
+            c.areaTotal += addArea;
+            c.pendingKills = 0;
+            c.pendingArea = 0;
+            c.bestKillsInGame = Math.max(c.bestKillsInGame, candBestKillsInGame);
+            c.bestKillStreak = Math.max(c.bestKillStreak, candBestKillStreak);
+            c.statsDirty = false;
+            c.lastStatsFlushMs = now;
+        } catch (SQLException e) {
+            System.err.println("[server] stats flush error: " + e.getMessage());
+        }
+    }
+
+    void checkAndUnlockAchievements(ClientConn c, Room room) {
+        if (c == null || room == null || !c.authed) return;
+
+        long totalKills = c.killsTotal + c.pendingKills;
+        long totalArea = c.areaTotal + c.pendingArea;
+        int bestScore = Math.max(c.bestScore, c.sessionMaxScore);
+        int bestKillsInGame = Math.max(c.bestKillsInGame, c.sessionKills);
+        int bestKillStreak = Math.max(c.bestKillStreak, c.sessionMaxKillStreak);
+
+        for (AchievementDef d : ACHIEVEMENTS) {
+            if (c.unlockedAchievements.contains(d.code())) continue;
+
+            boolean reached = switch (d.metric()) {
+                case TOTAL_KILLS -> totalKills >= d.threshold();
+                case TOTAL_AREA -> totalArea >= d.threshold();
+                case BEST_SCORE -> bestScore >= d.threshold();
+                case BEST_KILLS_IN_GAME -> bestKillsInGame >= d.threshold();
+                case BEST_KILL_STREAK -> bestKillStreak >= d.threshold();
+            };
+
+            if (!reached) continue;
+
+            try {
+                boolean inserted = db.unlockAchievement(c.userId, d.code());
+                if (inserted) {
+                    c.unlockedAchievements.add(d.code());
+                    room.systemChat("🏆 " + c.username + " unlocked achievement: " + d.title());
+                } else {
+                    c.unlockedAchievements.add(d.code());
+                }
+            } catch (SQLException e) {
+                System.err.println("[server] unlockAchievement error: " + e.getMessage());
+            }
+        }
     }
 
     // ---- broadcasting ----

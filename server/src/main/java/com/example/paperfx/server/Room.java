@@ -45,9 +45,20 @@ final class Room {
         return n;
     }
 
+    /**
+     * Allocates a stable small player index in [1..ROOM_CAPACITY] that is not in use.
+     * Returns -1 if none are available.
+     */
     int allocIdx() {
         for (int i = 1; i <= ROOM_CAPACITY; i++) if (!idxToPlayerId.containsKey(i)) return i;
         return -1;
+    }
+
+    /**
+     * Backward-compatible name used by earlier changes.
+     */
+    int nextIdx() {
+        return allocIdx();
     }
 
     void giveInitialTerritory(int idx, int cx, int cy) {
@@ -60,12 +71,16 @@ final class Room {
     }
 
     void join(ClientConn c, boolean spectator) {
+        Room old = (c.roomId != null) ? server.rooms.get(c.roomId) : null;
+
         if (spectator) {
-            // If switching rooms, remove old player first (spectators must be invisible on field)
-            if (c.playerId != null && c.roomId != null) {
-                Room old = server.rooms.get(c.roomId);
-                if (old != null) old.removePlayer(c.playerId, false);
-            }
+            // Switching to spectator: ensure the player entity is removed so the user becomes invisible.
+            if (c.playerId != null && old != null) old.removePlayer(c.playerId, false);
+
+            // Flush any pending stats and reset per-session counters.
+            server.flushUserStats(c, true);
+            server.resetSession(c);
+
             c.playerId = null;
             c.roomId = roomId;
             c.spectator = true;
@@ -73,24 +88,25 @@ final class Room {
             return;
         }
 
-        if (players.size() >= ROOM_CAPACITY) {
+        // Joining as a player: do not leave the current room if the target room is full.
+        if (players.size() >= ROOM_CAPACITY && (old == null || old != this)) {
             c.sendJson(ServerMain.error("room_full"));
             return;
         }
 
-        int idx = allocIdx();
-        if (idx < 0) {
-            c.sendJson(ServerMain.error("room_full"));
-            return;
-        }
+        // If switching rooms (or coming back from a previous player session), remove the old player first.
+        if (c.playerId != null && old != null) old.removePlayer(c.playerId, false);
 
-        // If switching rooms, remove old player
-        if (c.playerId != null && c.roomId != null) {
-            Room old = server.rooms.get(c.roomId);
-            if (old != null) old.removePlayer(c.playerId, false);
-        }
+        server.flushUserStats(c, true);
+        server.resetSession(c);
 
         String pid = UUID.randomUUID().toString();
+        int idx = nextIdx();
+        if (idx < 0) { // Should be rare, but handle race/snapshot cases safely.
+            c.sendJson(ServerMain.error("room_full"));
+            return;
+        }
+
         int sx = rnd.nextInt(GRID_W);
         int sy = rnd.nextInt(GRID_H);
 
@@ -99,7 +115,7 @@ final class Room {
 
         String color = ServerMain.pickColor(roomId, c.username);
 
-        PlayerEntity p = new PlayerEntity(c.userId, c.username, pid, idx, color, px, py, sx, sy);
+        PlayerEntity p = new PlayerEntity(c.userId, c.username, pid, idx, color, c, px, py, sx, sy);
         players.put(pid, p);
         idxToPlayerId.put(idx, pid);
 
@@ -130,8 +146,16 @@ final class Room {
         idxToPlayerId.remove(p.idx);
         p.clearTrail();
 
+        // Persist per-game result (best score / top scores) and flush batched stats.
         try { server.db.recordResult(p.userId, p.score); }
         catch (SQLException e) { System.err.println("[server] recordResult error: " + e.getMessage()); }
+
+        if (p.conn != null) {
+            // Keep best score cache reasonably fresh for profile/achievements.
+            if (p.score > p.conn.bestScore) p.conn.bestScore = p.score;
+            server.flushUserStats(p.conn, true);
+            server.resetSession(p.conn);
+        }
 
         if (!keepTerritory) {
             for (int i = 0; i < owners.length; i++) if (owners[i] == p.idx) owners[i] = 0;
@@ -182,6 +206,13 @@ final class Room {
             }
 
             p.score = countTerritoryCells(p.idx);
+            if (p.conn != null) {
+                if (p.score > p.conn.sessionMaxScore) {
+                    p.conn.sessionMaxScore = p.score;
+                    if (p.score > p.conn.bestScore) p.conn.bestScore = p.score;
+                    server.checkAndUnlockAchievements(p.conn, this);
+                }
+            }
         }
     }
 
@@ -191,6 +222,7 @@ final class Room {
             if (other.idx == mover.idx) continue;
             if (other.deadCooldownTicks > 0) continue;
             if (other.trailSet.contains(ServerMain.key(x, y))) {
+                recordKill(mover, other);
                 killAndRespawn(other, "trail intersected by " + mover.username);
             }
         }
@@ -205,6 +237,23 @@ final class Room {
             // Returning to own territory closes the loop and captures the enclosed area.
             if (!mover.trailList.isEmpty()) captureLoopOverwrite(mover);
         }
+    }
+
+    private void recordKill(PlayerEntity killer, PlayerEntity victim) {
+        if (killer == null || victim == null) return;
+        if (killer.conn == null) return;
+        ClientConn c = killer.conn;
+
+        c.pendingKills += 1;
+        c.statsDirty = true;
+        c.sessionKills += 1;
+        c.currentKillStreak += 1;
+        if (c.currentKillStreak > c.sessionMaxKillStreak) c.sessionMaxKillStreak = c.currentKillStreak;
+        if (c.sessionKills > c.bestKillsInGame) c.bestKillsInGame = c.sessionKills;
+        if (c.sessionMaxKillStreak > c.bestKillStreak) c.bestKillStreak = c.sessionMaxKillStreak;
+
+        // Check achievements safely (DB insert is idempotent; we also keep an in-memory cache).
+        server.checkAndUnlockAchievements(c, this);
     }
 
     private void addTrail(PlayerEntity p, int x, int y) {
@@ -249,12 +298,26 @@ final class Room {
             if (cy + 1 < GRID_H) pushIfOpen(q, outside, blocked, cur + GRID_W);
         }
 
+        long gained = 0;
+
         for (int i = 0; i < owners.length; i++) {
             if (blocked[i] || outside[i]) continue;
+            if (owners[i] != idx) gained++;
             owners[i] = idx;
         }
 
-        for (Messages.Cell c : p.trailList) owners[toIndex(c.x, c.y)] = idx;
+        for (Messages.Cell c : p.trailList) {
+            int ti = toIndex(c.x, c.y);
+            if (owners[ti] != idx) gained++;
+            owners[ti] = idx;
+        }
+
+        if (gained > 0 && p.conn != null) {
+            p.conn.pendingArea += gained;
+            p.conn.statsDirty = true;
+            // Achievements can depend on total captured area.
+            server.checkAndUnlockAchievements(p.conn, this);
+        }
 
         p.clearTrail();
     }
@@ -302,6 +365,22 @@ final class Room {
         msg.put("type", "chat_msg");
         msg.put("roomId", roomId);
         msg.put("from", from.username);
+        msg.put("text", text);
+        msg.put("ts", now);
+
+        server.broadcastJsonToRoom(roomId, msg);
+    }
+
+    void systemChat(String text) {
+        if (text == null) text = "";
+        text = text.trim();
+        if (text.isEmpty()) return;
+
+        long now = System.currentTimeMillis();
+        ObjectNode msg = Net.MAPPER.createObjectNode();
+        msg.put("type", "chat_msg");
+        msg.put("roomId", roomId);
+        msg.put("from", "SYSTEM");
         msg.put("text", text);
         msg.put("ts", now);
 
