@@ -8,12 +8,6 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
 
-/**
- * Слой работы с базой данных (PostgreSQL) через JDBC.
- * <p>
- * Отвечает за пользователей, результаты (top-scores) и статистику/достижения.
- */
-
 public final class Db {
     private final String url;
     private final String user;

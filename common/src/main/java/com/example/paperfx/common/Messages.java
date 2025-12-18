@@ -2,7 +2,7 @@ package com.example.paperfx.common;
 
 import java.util.List;
 
-/** Общие DTO-сообщения для TCP протокола JSONL (1 JSON = 1 строка). */
+/** Shared DTOs for the TCP JSON-lines protocol. */
 public final class Messages {
     private Messages() {}
 
@@ -20,7 +20,7 @@ public final class Messages {
         public LeaderEntry() {}
     }
 
-    // ---- клиент → сервер ----
+    // ---- client -> server ----
     public static final class Register {
         public final String type = "register";
         public String username;
@@ -69,7 +69,7 @@ public final class Messages {
 
     public static final class Ping { public final String type = "ping"; }
 
-    // ---- сервер → клиент ----
+    // ---- server -> client ----
     public static final class AuthOk {
         public final String type = "auth_ok";
         public String userId;
