@@ -5,6 +5,12 @@ import com.example.paperfx.common.Messages;
 import java.util.ArrayList;
 import java.util.HashSet;
 
+/**
+ * Игровая сущность игрока внутри комнаты: позиция, ввод, след, счёт и цвет.
+ * <p>
+ * Создаётся на сервере при входе игроком в комнату.
+ */
+
 final class PlayerEntity {
     final String userId;
     final String username;

@@ -13,6 +13,13 @@ import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicLong;
 
+/**
+ * Главный класс сервера PaperFX.
+ * <p>
+ * Принимает TCP-подключения, обрабатывает входящие JSONL-сообщения,
+ * управляет комнатами и рассылает состояние игры клиентам.
+ */
+
 public final class ServerMain {
 
     final Db db;
@@ -29,7 +36,7 @@ public final class ServerMain {
 
     private final AtomicLong roomSeq = new AtomicLong(1);
 
-    // ---- achievements ----
+    // ---- достижения ----
     enum AchMetric { TOTAL_KILLS, TOTAL_AREA, BEST_SCORE, BEST_KILLS_IN_GAME, BEST_KILL_STREAK }
 
     record AchievementDef(String code, String title, String desc, AchMetric metric, long threshold) {}
@@ -106,14 +113,14 @@ public final class ServerMain {
             double dt = (now - lastNs[0]) / 1_000_000_000.0;
             lastNs[0] = now;
 
-            // Snapshot to avoid concurrent modification when rooms are added/removed.
+            // Снимок коллекции комнат, чтобы избежать ошибка одновременной модификации при добавлении/удалении.
             List<Room> snap = new ArrayList<>(rooms.values());
 
             for (Room room : snap) room.step(dt);
             long t = tick.incrementAndGet();
             for (Room room : snap) room.broadcastState(t);
 
-            // Periodic cleanup of empty rooms (keep MAIN forever).
+            // Периодическая очистка пустых комнат (главную комнату не удаляем).
             if (t % 20 == 0) cleanupEmptyRooms();
             if (t % 600 == 0) flushAllUserStats(false);
 
@@ -147,7 +154,7 @@ public final class ServerMain {
         return rooms.computeIfAbsent(finalId, rid -> new Room(this, rid));
     }
 
-    // ---- called by ClientConn ----
+    // ---- вызывается из класса соединения клиента ----
 
     void onMessage(ClientConn c, String type, JsonNode n) {
         try {
@@ -170,7 +177,7 @@ public final class ServerMain {
     void onDisconnected(ClientConn c) {
         clients.remove(c);
 
-        // Flush any pending stats for spectators / disconnected clients.
+        // Записываем накопленную статистику для наблюдателей/отключившихся клиентов.
         flushUserStats(c, true);
 
         if (c.username != null) activeByUsername.remove(c.username, c);
@@ -178,7 +185,7 @@ public final class ServerMain {
         if (c.roomId != null) {
             Room room = rooms.get(c.roomId);
             if (room != null && c.playerId != null) room.removePlayer(c.playerId, false);
-            // Remove empty rooms (except MAIN)
+            // Удаляем пустые комнаты (кроме главной).
             cleanupEmptyRooms();
         }
 
@@ -189,14 +196,14 @@ public final class ServerMain {
         } catch (Exception ignored) {}
     }
 
-    // ---- handlers ----
+    // ---- обработчики ----
 
     private void onRegister(ClientConn c, JsonNode n) throws SQLException {
         String u = n.path("username").asText("");
         String p = n.path("password").asText("");
         Db.RegisterResult r = db.register(u, p);
         if (!r.ok()) { c.sendJson(error(r.error())); return; }
-        // auto-login
+        // авто-логин
         ObjectNode login = Net.MAPPER.createObjectNode();
         login.put("type", "login");
         login.put("username", u);
@@ -213,7 +220,7 @@ public final class ServerMain {
         Db.LoginResult r = db.login(u, p);
         if (!r.ok()) { c.sendJson(error(r.error())); return; }
 
-        // 1 active session per username: new login kicks old
+        // 1 активная сессия на имя пользователя: новый вход выкидывает старый
         ClientConn prev = activeByUsername.put(r.username(), c);
         if (prev != null && prev != c) {
             prev.sendJson(error("kicked_duplicate_login"));
@@ -246,7 +253,7 @@ public final class ServerMain {
             throw new RuntimeException(e);
         }
 
-        // Auto-join MAIN (or another non-full room; otherwise auto-create a new room)
+        // Автовход в главную комнату (или другую неполную; иначе создаём новую).
         Room main = getOrCreateRoom("MAIN");
         if (main.players.size() < Room.ROOM_CAPACITY) {
             main.join(c, false);
@@ -278,7 +285,7 @@ public final class ServerMain {
      * MAIN is never removed.
      */
     private void cleanupEmptyRooms() {
-        // Determine which roomIds are currently occupied by any authenticated connection (players or spectators).
+        // Определяем, какие комнаты заняты любыми авторизованными подключениями (игроки/наблюдатели).
         HashSet<String> occupied = new HashSet<>();
         for (ClientConn c : clients) {
             if (!c.authed) continue;
@@ -336,7 +343,7 @@ public final class ServerMain {
     private void onProfileGet(ClientConn c) {
         if (!c.authed) { c.sendJson(error("not_authenticated")); return; }
 
-        // Do not force-flush on every profile open; just show projected values including pending deltas.
+        // Не делаем принудительную запись в БД при каждом открытии профиля; показываем значения с учётом накопленных дельт.
         ObjectNode msg = Net.MAPPER.createObjectNode();
         msg.put("type", "profile");
         msg.put("username", c.username);
@@ -392,7 +399,7 @@ public final class ServerMain {
         int candBestKillsInGame = Math.max(c.bestKillsInGame, c.sessionKills);
         int candBestKillStreak = Math.max(c.bestKillStreak, c.sessionMaxKillStreak);
 
-        // Nothing to write
+        // Нечего записывать
         if (!force && addKills == 0 && addArea == 0 &&
                 candBestKillsInGame == c.bestKillsInGame &&
                 candBestKillStreak == c.bestKillStreak) {
@@ -452,7 +459,7 @@ public final class ServerMain {
         }
     }
 
-    // ---- broadcasting ----
+    // ---- рассылка ----
 
     void broadcastToRoom(String roomId, String jsonLine) {
         for (ClientConn c : clients) {
@@ -468,7 +475,7 @@ public final class ServerMain {
         } catch (Exception ignored) {}
     }
 
-    // ---- utils ----
+    // ---- утилиты ----
 
     static ObjectNode error(String reason) {
         ObjectNode n = Net.MAPPER.createObjectNode();

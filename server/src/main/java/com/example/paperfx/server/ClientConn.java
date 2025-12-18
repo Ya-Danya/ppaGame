@@ -7,6 +7,12 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 import java.io.*;
 import java.net.Socket;
 
+/**
+ * Состояние одного подключённого TCP-клиента на сервере.
+ * <p>
+ * Содержит сокет, потоки ввода/вывода, а также кэш авторизации/профиля/статистики.
+ */
+
 final class ClientConn implements Closeable {
     final ServerMain server;
     final Socket socket;
@@ -23,31 +29,34 @@ final class ClientConn implements Closeable {
 
     volatile long lastChatMs = 0;
 
-    // ---- persistent profile/stats cache (loaded on login) ----
-    // All-time totals (from DB, plus in-memory pending deltas)
+    // ---- кэш профиля/статистики (загружается при логине) ----
+    // Итоговые значения за всё время (из БД + накопленные дельты в памяти)
     volatile long killsTotal = 0;
     volatile long areaTotal = 0;
 
-    // Best values (cached from DB / session)
-    volatile int bestScore = 0;          // max score ever (best_score in app_users)
-    volatile int bestKillsInGame = 0;    // max kills in a single game/session
-    volatile int bestKillStreak = 0;     // max kill streak ever
+    // Лучшие значения (кэш из БД / текущей сессии)
+    volatile int bestScore = 0;          // максимальный счёт за всё время (столбец best_score в app_users)
+    volatile int bestKillsInGame = 0;    // максимум убийств за одну игру/сессию
+    volatile int bestKillStreak = 0;     // максимальная серия убийств за всё время
 
-    // Pending deltas to flush to DB (batched)
+    // Накопленные дельты для записи в БД (батчами)
     volatile long pendingKills = 0;
     volatile long pendingArea = 0;
     volatile boolean statsDirty = false;
 
-    // Current session (since last join as a player)
+    // Текущая игровая сессия (с момента входа в игру игроком)
     volatile int sessionKills = 0;
     volatile int currentKillStreak = 0;
     volatile int sessionMaxKillStreak = 0;
     volatile int sessionMaxScore = 0;
 
-    // Achievement cache (to avoid extra DB writes)
+    // Кэш достижений (чтобы не делать лишние записи в БД)
     final java.util.Set<String> unlockedAchievements = java.util.concurrent.ConcurrentHashMap.newKeySet();
 
     volatile long lastStatsFlushMs = 0;
+    /**
+     * Создаёт соединение с клиентом и поднимает потоки ввода/вывода.
+     */
 
     ClientConn(ServerMain server, Socket socket) throws IOException {
         this.server = server;
@@ -61,6 +70,9 @@ final class ClientConn implements Closeable {
         t.setDaemon(true);
         t.start();
     }
+    /**
+     * Основной цикл чтения: читает JSONL строки из сокета и передаёт на обработку серверу.
+     */
 
     void run() {
         try {
@@ -79,6 +91,9 @@ final class ClientConn implements Closeable {
     void send(String jsonLine) {
         try { out.println(jsonLine); } catch (Exception ignored) {}
     }
+    /**
+     * Отправляет JSON-объект клиенту одной строкой.
+     */
 
     void sendJson(ObjectNode node) {
         try { send(Net.MAPPER.writeValueAsString(node)); } catch (Exception ignored) {}

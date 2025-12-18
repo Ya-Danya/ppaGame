@@ -5,6 +5,12 @@ import javax.crypto.spec.PBEKeySpec;
 import java.security.SecureRandom;
 import java.util.Base64;
 
+/**
+ * Утилиты для безопасного хранения паролей.
+ * <p>
+ * Используется PBKDF2 (salt + hash) для хэширования пароля перед сохранением в БД.
+ */
+
 public final class PasswordUtil {
     private PasswordUtil() {}
 
