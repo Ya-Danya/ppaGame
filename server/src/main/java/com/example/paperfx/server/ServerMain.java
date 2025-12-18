@@ -13,6 +13,13 @@ import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicLong;
 
+
+/**
+* Главный класс UDP-сервера PaperFX.
+ * <p>
+ * Сервер авторитетно ведёт состояние комнат и рассылает снапшоты {@code state}.
+ * Транспорт: {@link java.net.DatagramSocket}, 1 датаграмма = 1 JSON-сообщение (UTF‑8).
+*/
 public final class ServerMain {
 
     final Db db;
@@ -31,7 +38,7 @@ public final class ServerMain {
 
     private final AtomicLong roomSeq = new AtomicLong(1);
 
-    // ---- achievements ----
+    // ---- достижения ----
     enum AchMetric { TOTAL_KILLS, TOTAL_AREA, BEST_SCORE, BEST_KILLS_IN_GAME, BEST_KILL_STREAK }
 
     record AchievementDef(String code, String title, String desc, AchMetric metric, long threshold) {}
@@ -64,7 +71,7 @@ public final class ServerMain {
     }
 
     private static final long STATS_FLUSH_INTERVAL_MS = 30_000;
-    private static final long CLIENT_IDLE_TIMEOUT_MS = 90_000; // UDP: remove dead sessions after 90s
+    private static final long CLIENT_IDLE_TIMEOUT_MS = 90_000; // UDP: удаляем «мертвые» сессии после 90 секунд бездействия
 
     public static void main(String[] args) throws Exception {
         int port = args.length >= 1 ? Integer.parseInt(args[0]) : 7777;
@@ -110,14 +117,14 @@ public final class ServerMain {
             double dt = (now - lastNs[0]) / 1_000_000_000.0;
             lastNs[0] = now;
 
-            // Snapshot to avoid concurrent modification when rooms are added/removed.
+            // Делаем снимок списка комнат, чтобы избежать concurrent modification при добавлении/удалении комнат.
             List<Room> snap = new ArrayList<>(rooms.values());
 
             for (Room room : snap) room.step(dt);
             long t = tick.incrementAndGet();
             for (Room room : snap) room.broadcastState(t);
 
-            // Periodic cleanup of empty rooms (keep MAIN forever).
+            // Периодически удаляем пустые комнаты (кроме MAIN — она живёт всегда).
             if (t % 20 == 0) cleanupEmptyRooms();
             if (t % 600 == 0) flushAllUserStats(false);
             if (t % 40 == 0) cleanupIdleClients();
@@ -128,7 +135,7 @@ public final class ServerMain {
     }
 
     private void receiveLoop() {
-        // UDP: one datagram == one JSON message (ASCII/UTF-8)
+        // UDP: 1 датаграмма == 1 JSON-сообщение (UTF‑8)
         byte[] buf = new byte[64 * 1024];
         DatagramPacket pkt = new DatagramPacket(buf, buf.length);
 
@@ -173,7 +180,7 @@ public final class ServerMain {
         long now = System.currentTimeMillis();
         for (ClientConn c : new ArrayList<>(clients)) {
             if (now - c.lastSeenMs <= CLIENT_IDLE_TIMEOUT_MS) continue;
-            // Consider idle as disconnected
+            // Считаем бездействие отключением
             onDisconnected(c);
         }
     }
@@ -185,7 +192,7 @@ public final class ServerMain {
         return rooms.computeIfAbsent(finalId, rid -> new Room(this, rid));
     }
 
-    // ---- called by ClientConn ----
+    // ---- вызывается из ClientConn ----
 
     void onMessage(ClientConn c, String type, JsonNode n) {
         try {
@@ -197,7 +204,7 @@ public final class ServerMain {
                 case "join_room" -> onJoinRoom(c, n);
                 case "chat_send" -> onChatSend(c, n);
                 case "profile_get" -> onProfileGet(c);
-                case "ping" -> { /* keepalive */ }
+                case "ping" -> { /* keepalive / поддержание сессии */ }
                 default -> c.sendJson(error("unknown_message"));
             }
         } catch (Exception e) {
@@ -211,7 +218,7 @@ public final class ServerMain {
         clients.remove(c);
         clientsByAddr.remove(c.addr, c);
 
-        // Flush any pending stats for spectators / disconnected clients.
+        // Сбрасываем накопленную статистику для наблюдателей / отключившихся клиентов.
         flushUserStats(c, true);
 
         if (c.username != null) activeByUsername.remove(c.username, c);
@@ -219,7 +226,7 @@ public final class ServerMain {
         if (c.roomId != null) {
             Room room = rooms.get(c.roomId);
             if (room != null && c.playerId != null) room.removePlayer(c.playerId, false);
-            // Remove empty rooms (except MAIN)
+            // Удаляем пустые комнаты (кроме MAIN)
             cleanupEmptyRooms();
         }
 
@@ -228,14 +235,14 @@ public final class ServerMain {
         } catch (Exception ignored) {}
     }
 
-    // ---- handlers ----
+    // ---- обработчики сообщений ----
 
     private void onRegister(ClientConn c, JsonNode n) throws SQLException {
         String u = n.path("username").asText("");
         String p = n.path("password").asText("");
         Db.RegisterResult r = db.register(u, p);
         if (!r.ok()) { c.sendJson(error(r.error())); return; }
-        // auto-login
+        // авто-логин
         ObjectNode login = Net.MAPPER.createObjectNode();
         login.put("type", "login");
         login.put("username", u);
@@ -252,11 +259,11 @@ public final class ServerMain {
         Db.LoginResult r = db.login(u, p);
         if (!r.ok()) { c.sendJson(error(r.error())); return; }
 
-        // 1 active session per username: new login kicks old
+        // 1 активная сессия на username: новый логин кикает старую
         ClientConn prev = activeByUsername.put(r.username(), c);
         if (prev != null && prev != c) {
             prev.sendJson(error("kicked_duplicate_login"));
-            // UDP: treat as disconnected and remove mapping
+            // UDP: считаем старую сессию отключившейся и удаляем её
             onDisconnected(prev);
         }
 
@@ -264,7 +271,7 @@ public final class ServerMain {
         c.userId = r.userId();
         c.username = r.username();
 
-        // Load user stats and unlocked achievements cache
+        // Загружаем статистику пользователя и кэш достижений
         Db.UserStats us = db.loadOrCreateStats(c.userId);
         c.killsTotal = us.kills();
         c.areaTotal = us.area();
@@ -281,7 +288,7 @@ public final class ServerMain {
             throw new RuntimeException(e);
         }
 
-        // Auto-join MAIN (or another non-full room; otherwise auto-create a new room)
+        // Авто-вход: MAIN (или другая неполная комната; иначе авто-создание новой комнаты)
         Room main = getOrCreateRoom("MAIN");
         if (main.players.size() < Room.ROOM_CAPACITY) {
             main.join(c, false);
@@ -297,8 +304,8 @@ public final class ServerMain {
     }
 
     /**
-     * Generates a unique id for an auto-created room.
-     * Example: AUTO1, AUTO2, ...
+     * Генерирует уникальный id для автоматически созданной комнаты.
+     * Пример: AUTO1, AUTO2, ...
      */
     private String newAutoRoomId() {
         while (true) {
@@ -309,11 +316,11 @@ public final class ServerMain {
     }
 
     /**
-     * Removes rooms that have no connected authenticated clients.
-     * MAIN is never removed.
+     * Удаляет комнаты, в которых нет подключённых авторизованных клиентов.
+     * Комната MAIN никогда не удаляется.
      */
     private void cleanupEmptyRooms() {
-        // Determine which roomIds are currently occupied by any authenticated connection (players or spectators).
+        // Определяем, какие комнаты сейчас заняты любым авторизованным подключением (игроком или наблюдателем).
         HashSet<String> occupied = new HashSet<>();
         for (ClientConn c : clients) {
             if (!c.authed) continue;
@@ -381,7 +388,7 @@ public final class ServerMain {
             msg.put("bestKillsInGame", us.bestKillsInGame());
             msg.put("bestKillStreak", us.bestKillStreak());
 
-            // Achievements list
+            // Список достижений
             var arr = msg.putArray("achievements");
             for (String ac : db.listAchievementCodes(c.userId)) arr.add(ac);
 
@@ -391,7 +398,7 @@ public final class ServerMain {
         }
     }
 
-    // ---- broadcasting ----
+    // ---- рассылка ----
 
     void broadcastToRoom(String roomId, String jsonLine) {
         for (ClientConn c : clients) {
@@ -407,7 +414,7 @@ public final class ServerMain {
         } catch (Exception ignored) {}
     }
 
-    // ---- achievements + stats flushing ----
+    // ---- достижения + сброс статистики ----
 
     void resetSession(ClientConn c) {
         if (c == null) return;
@@ -436,7 +443,7 @@ public final class ServerMain {
 
         if (dk == 0 && da == 0 && !force) return;
 
-        // Move pending to totals (optimistic)
+        // Переносим pending в totals (оптимистично)
         c.pendingKills = 0;
         c.pendingArea = 0;
         c.statsDirty = false;
@@ -448,7 +455,7 @@ public final class ServerMain {
         try {
             db.applyStats(c.userId, dk, da, c.bestKillsInGame, c.bestKillStreak);
         } catch (Exception e) {
-            // restore pending if failed
+            // если запись не удалась — возвращаем pending обратно
             c.pendingKills += dk;
             c.pendingArea += da;
             c.statsDirty = true;
@@ -459,7 +466,7 @@ public final class ServerMain {
         if (c == null || !c.authed) return;
         if (room == null) return;
 
-        // Opportunistically flush stats if a long time has passed
+        // По ситуации сбрасываем статистику, если давно не писали в БД
         flushUserStats(c, false);
 
         long totalKills = c.killsTotal + c.pendingKills;
@@ -483,7 +490,7 @@ public final class ServerMain {
             }
 
             if (val >= def.threshold()) {
-                // Persist idempotently
+                // Сохраняем идемпотентно
                 try {
                     boolean inserted = db.unlockAchievement(c.userId, def.code());
                     if (inserted) {
@@ -495,7 +502,7 @@ public final class ServerMain {
         }
     }
 
-    // ---- utils ----
+    // ---- утилиты ----
 
     static ObjectNode error(String reason) {
         ObjectNode n = Net.MAPPER.createObjectNode();

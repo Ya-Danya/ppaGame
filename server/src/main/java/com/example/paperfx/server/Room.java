@@ -46,8 +46,8 @@ final class Room {
     }
 
     /**
-     * Allocates a stable small player index in [1..ROOM_CAPACITY] that is not in use.
-     * Returns -1 if none are available.
+     * Выделяет стабильный «маленький» индекс игрока в диапазоне [1..ROOM_CAPACITY], который сейчас не занят.
+     * Возвращает -1, если свободных индексов нет.
      */
     int allocIdx() {
         for (int i = 1; i <= ROOM_CAPACITY; i++) if (!idxToPlayerId.containsKey(i)) return i;
@@ -55,7 +55,7 @@ final class Room {
     }
 
     /**
-     * Backward-compatible name used by earlier changes.
+     * Совместимое имя метода, оставленное для обратной совместимости со старыми изменениями.
      */
     int nextIdx() {
         return allocIdx();
@@ -74,10 +74,10 @@ final class Room {
         Room old = (c.roomId != null) ? server.rooms.get(c.roomId) : null;
 
         if (spectator) {
-            // Switching to spectator: ensure the player entity is removed so the user becomes invisible.
+            // Переход в режим наблюдателя: удаляем сущность игрока, чтобы пользователь стал «невидимым» в игре.
             if (c.playerId != null && old != null) old.removePlayer(c.playerId, false);
 
-            // Flush any pending stats and reset per-session counters.
+            // Сбрасываем накопленную статистику в БД и обнуляем счётчики текущей сессии.
             server.flushUserStats(c, true);
             server.resetSession(c);
 
@@ -88,13 +88,13 @@ final class Room {
             return;
         }
 
-        // Joining as a player: do not leave the current room if the target room is full.
+        // Вход как игрок: не покидаем текущую комнату, если целевая переполнена.
         if (players.size() >= ROOM_CAPACITY && (old == null || old != this)) {
             c.sendJson(ServerMain.error("room_full"));
             return;
         }
 
-        // If switching rooms (or coming back from a previous player session), remove the old player first.
+        // При смене комнаты (или возвращении из прошлой игровой сессии) сначала удаляем старого игрока.
         if (c.playerId != null && old != null) old.removePlayer(c.playerId, false);
 
         server.flushUserStats(c, true);
@@ -102,7 +102,7 @@ final class Room {
 
         String pid = UUID.randomUUID().toString();
         int idx = nextIdx();
-        if (idx < 0) { // Should be rare, but handle race/snapshot cases safely.
+        if (idx < 0) { // Редкий случай, но на всякий случай обрабатываем гонку/снимок состояния безопасно.
             c.sendJson(ServerMain.error("room_full"));
             return;
         }
@@ -146,12 +146,12 @@ final class Room {
         idxToPlayerId.remove(p.idx);
         p.clearTrail();
 
-        // Persist per-game result (best score / top scores) and flush batched stats.
+        // Сохраняем результат игры (для best_score/истории) и сбрасываем накопленные дельты статистики.
         try { server.db.recordResult(p.userId, p.score); }
         catch (SQLException e) { System.err.println("[server] recordResult error: " + e.getMessage()); }
 
         if (p.conn != null) {
-            // Keep best score cache reasonably fresh for profile/achievements.
+            // Обновляем кэш bestScore, чтобы профиль/достижения были актуальнее.
             if (p.score > p.conn.bestScore) p.conn.bestScore = p.score;
             server.flushUserStats(p.conn, true);
             server.resetSession(p.conn);
@@ -217,7 +217,7 @@ final class Room {
     }
 
     private void onEnterCell(PlayerEntity mover, int x, int y) {
-        // If mover steps on someone else's trail => that OTHER dies
+        // Если игрок наступает на чужой след — умирает ВЛАДЕЛЕЦ пересечённого следа.
         for (PlayerEntity other : players.values()) {
             if (other.idx == mover.idx) continue;
             if (other.deadCooldownTicks > 0) continue;
@@ -231,10 +231,10 @@ final class Room {
         boolean inOwnTerritory = owners[toIndex(x, y)] == idx;
 
         if (!inOwnTerritory) {
-            // Outside of own territory: extend trail. Capturing is allowed ONLY when returning to owned territory.
+            // Вне своей территории: продолжаем след. Захват выполняется ТОЛЬКО при возвращении на свою территорию.
             addTrail(mover, x, y);
         } else {
-            // Returning to own territory closes the loop and captures the enclosed area.
+            // Возврат на свою территорию замыкает контур и захватывает замкнутую область.
             if (!mover.trailList.isEmpty()) captureLoopOverwrite(mover);
         }
     }
@@ -252,7 +252,7 @@ final class Room {
         if (c.sessionKills > c.bestKillsInGame) c.bestKillsInGame = c.sessionKills;
         if (c.sessionMaxKillStreak > c.bestKillStreak) c.bestKillStreak = c.sessionMaxKillStreak;
 
-        // Check achievements safely (DB insert is idempotent; we also keep an in-memory cache).
+        // Проверяем достижения безопасно (INSERT идемпотентен; также держим кэш в памяти).
         server.checkAndUnlockAchievements(c, this);
     }
 
@@ -315,7 +315,7 @@ final class Room {
         if (gained > 0 && p.conn != null) {
             p.conn.pendingArea += gained;
             p.conn.statsDirty = true;
-            // Achievements can depend on total captured area.
+            // Достижения могут зависеть от суммарно захваченной площади.
             server.checkAndUnlockAchievements(p.conn, this);
         }
 
@@ -338,7 +338,7 @@ final class Room {
         }
         ps.sort(Comparator.comparingInt((Messages.Player pl) -> pl.score).reversed());
 
-        // Leaderboard per room
+        // Лидерборд внутри комнаты
         List<Messages.LeaderEntry> lb = new ArrayList<>();
         for (Messages.Player pl : ps) lb.add(new Messages.LeaderEntry(pl.username, pl.score));
 

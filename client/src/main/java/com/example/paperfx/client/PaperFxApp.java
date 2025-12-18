@@ -26,37 +26,37 @@ import java.util.*;
 import java.util.concurrent.ConcurrentLinkedQueue;
 
 /**
- * PaperFX client (UDP transport, Java 17).
- * 1 UDP datagram == 1 JSON message (newline-delimited for convenience).
+ * Клиент PaperFX (транспорт UDP, Java 17).
+ * 1 UDP-датаграмма == 1 JSON-сообщение (в конце добавляется \n для удобства).
  *
- * IMPORTANT: Server requires auth (login/register) before game actions.
+ * ВАЖНО: сервер требует авторизацию (login/register) перед игровыми действиями.
  */
 public final class PaperFxApp extends Application {
 
-    // ---------------- networking (UDP) ----------------
+    // ---------------- сеть (UDP) ----------------
     private DatagramSocket udp;
     private InetSocketAddress serverAddr;
     private volatile boolean netRunning = false;
     private Thread netThread;
     private final ConcurrentLinkedQueue<String> inbox = new ConcurrentLinkedQueue<>();
 
-    // default endpoint (can be made configurable later)
+    // адрес по умолчанию (при желании можно сделать настраиваемым)
     private String host = "127.0.0.1";
     private int port = 7777;
 
-    // ---------------- UI scenes ----------------
+    // ---------------- сцены UI ----------------
     private Stage stage;
     private Scene loginScene;
     private Scene gameScene;
 
-    // login ui
+    // UI входа
     private TextField tfUser;
     private PasswordField pfPass;
     private TextField tfPassVisible;
     private CheckBox cbShowPass;
     private Label lblLoginStatus;
 
-    // game ui
+    // UI игры
     private Canvas canvas;
     private GraphicsContext g;
 
@@ -70,32 +70,32 @@ public final class PaperFxApp extends Application {
 
     private Label statusLabel;
 
-    // profile widget
+    // виджет профиля
     private HBox profileBox;
     private Label profileName;
     private StackPane profileDot;
     private VBox profilePopup;
     private boolean profilePopupVisible = false;
 
-    // game input
+    // игровой ввод
     private int wantDx = 0, wantDy = 0;
     private boolean gameControlEnabled = true;
 
-    // auth/player context
+    // контекст авторизации/игрока
     private String myUsername = "";
     private String playerId = null;
     private String roomId = "MAIN";
     private boolean spectator = false;
 
-    // state from server
+    // состояние от сервера
     private int CELL = 10, GRID_W = 80, GRID_H = 60;
     private int[] owners = new int[GRID_W * GRID_H];
     private final Map<Integer, String> idxToColor = new HashMap<>();
     private final Map<String, PlayerView> players = new HashMap<>();
 
-    // visuals
-    private final Color bgCell = Color.web("#2b2b2b");      // dark gray
-    private final Color gridLine = Color.rgb(0, 0, 0, 0.55);// dark black-ish
+    // визуальные параметры
+    private final Color bgCell = Color.web("#2b2b2b");      // тёмно-серый
+    private final Color gridLine = Color.rgb(0, 0, 0, 0.55);// почти чёрный (полупрозрачный)
     private final Color uiBg = Color.web("#1e1e1e");
     private final Color uiBorder = Color.web("#333333");
     private final Color uiText = Color.web("#dddddd");
@@ -107,7 +107,7 @@ public final class PaperFxApp extends Application {
         double x, y;
         int score;
         Color color;
-        List<int[]> trail; // list of cells
+        List<int[]> trail; // список клеток
     }
 
     @Override
@@ -123,7 +123,7 @@ public final class PaperFxApp extends Application {
         stage.setHeight(760);
         stage.show();
 
-        // UDP connect early (so login can send immediately)
+        // Открываем UDP-сокет заранее, чтобы login/register могли сразу отправлять сообщения
         try {
             ensureConnected(host, port);
         } catch (IOException e) {
@@ -138,7 +138,7 @@ public final class PaperFxApp extends Application {
         }.start();
     }
 
-    // ---------------- Login scene ----------------
+    // ---------------- сцена входа ----------------
 
     private Scene buildLoginScene() {
         BorderPane root = new BorderPane();
@@ -192,7 +192,7 @@ public final class PaperFxApp extends Application {
         btnLogin.setOnAction(e -> doAuth("login"));
         btnRegister.setOnAction(e -> doAuth("register"));
 
-        // Enter on password triggers login
+        // Enter в поле пароля выполняет вход
         pfPass.setOnAction(e -> doAuth("login"));
         tfPassVisible.setOnAction(e -> doAuth("login"));
 
@@ -244,13 +244,13 @@ public final class PaperFxApp extends Application {
         }
     }
 
-    // ---------------- Game scene ----------------
+    // ---------------- сцена игры ----------------
 
     private Scene buildGameScene() {
         BorderPane root = new BorderPane();
         root.setBackground(new Background(new BackgroundFill(uiBg, CornerRadii.EMPTY, Insets.EMPTY)));
 
-        // canvas center
+        // центрируем canvas
         canvas = new Canvas(GRID_W * CELL, GRID_H * CELL);
         canvas.setFocusTraversable(true);
         g = canvas.getGraphicsContext2D();
@@ -259,7 +259,7 @@ public final class PaperFxApp extends Application {
         center.setPadding(new Insets(8));
         root.setCenter(center);
 
-        // right panel (rooms + chat)
+        // правая панель (комнаты + чат)
         VBox right = new VBox(8);
         right.setPadding(new Insets(8));
         right.setPrefWidth(320);
@@ -268,7 +268,7 @@ public final class PaperFxApp extends Application {
         statusLabel = new Label("connected");
         statusLabel.setTextFill(uiText);
 
-        // rooms panel
+        // панель комнат
         roomIdField = new TextField();
         roomIdField.setPromptText("room id (e.g. MAIN)");
         styleInput(roomIdField);
@@ -284,7 +284,7 @@ public final class PaperFxApp extends Application {
         HBox roomBtns = new HBox(6, btnJoinRoom, btnCreateRoom, btnSpectateOrPlay);
         roomBtns.setAlignment(Pos.CENTER_LEFT);
 
-        // chat
+        // чат
         chatLog = new TextArea();
         chatLog.setEditable(false);
         chatLog.setWrapText(true);
@@ -300,7 +300,7 @@ public final class PaperFxApp extends Application {
 
         root.setRight(right);
 
-        // top bar with profile
+        // верхняя панель с профилем
         BorderPane top = new BorderPane();
         top.setPadding(new Insets(8));
         top.setBackground(new Background(new BackgroundFill(uiBg, CornerRadii.EMPTY, Insets.EMPTY)));
@@ -337,7 +337,7 @@ public final class PaperFxApp extends Application {
             sendChat(text.trim());
         });
 
-        // focus fix: click on canvas returns control
+        // фиксация фокуса: клик по canvas возвращает управление
         canvas.setOnMouseClicked(e -> {
             if (e.getButton() == MouseButton.PRIMARY) {
                 canvas.requestFocus();
@@ -345,7 +345,7 @@ public final class PaperFxApp extends Application {
             }
         });
 
-        // when focusing chat input, pause control and send stop
+        // при фокусе на вводе чата: отключаем управление и отправляем стоп-ввод
         chatInput.focusedProperty().addListener((obs, was, isNow) -> {
             if (isNow) {
                 gameControlEnabled = false;
@@ -375,12 +375,12 @@ public final class PaperFxApp extends Application {
         });
     }
 
-    // ---------------- UDP networking ----------------
+    // ---------------- сеть UDP ----------------
 
     private void ensureConnected(String host, int port) throws IOException {
         if (udp != null && !udp.isClosed()) return;
         serverAddr = new InetSocketAddress(InetAddress.getByName(host), port);
-        udp = new DatagramSocket(); // ephemeral local port
+        udp = new DatagramSocket(); // локальный порт выбирается ОС (эпемерный)
         udp.connect(serverAddr);
 
         netRunning = true;
@@ -436,7 +436,7 @@ public final class PaperFxApp extends Application {
         }
     }
 
-    // ---------------- protocol helpers ----------------
+    // ---------------- вспомогательные методы протокола ----------------
 
     private void sendInput(int dx, int dy) {
         ObjectNode n = Net.MAPPER.createObjectNode();
@@ -476,7 +476,7 @@ public final class PaperFxApp extends Application {
         sendNode(n);
     }
 
-    // ---------------- network pump ----------------
+    // ---------------- обработка входящих сообщений ----------------
 
     private void pumpNetwork(int max) {
         for (int i = 0; i < max; i++) {
@@ -490,7 +490,7 @@ public final class PaperFxApp extends Application {
                 switch (type) {
                     case "error" -> {
                         String reason = n.path("reason").asText("error");
-                        // show on login screen if currently there
+                        // показываем на экране входа, если он сейчас активен
                         if (stage.getScene() == loginScene) {
                             Platform.runLater(() -> lblLoginStatus.setText(reason));
                         } else {
@@ -522,7 +522,7 @@ public final class PaperFxApp extends Application {
                     case "state" -> applyState(n);
                     case "profile" -> showProfileFromServer(n);
                     default -> {
-                        // ignore unknown
+                        // неизвестные сообщения игнорируем
                     }
                 }
             } catch (Exception ex) {
@@ -575,14 +575,14 @@ public final class PaperFxApp extends Application {
         }
     }
 
-    // ---------------- drawing ----------------
+    // ---------------- отрисовка ----------------
 
     private void draw() {
-        // background cells
+        // фоновые клетки
         g.setFill(bgCell);
         g.fillRect(0, 0, canvas.getWidth(), canvas.getHeight());
 
-        // territory fills using per-player color mapping
+        // заливка территорий (цвет по игроку)
         for (int y = 0; y < GRID_H; y++) {
             for (int x = 0; x < GRID_W; x++) {
                 int idx = owners[y * GRID_W + x];
@@ -595,7 +595,7 @@ public final class PaperFxApp extends Application {
             }
         }
 
-        // grid lines
+        // линии сетки
         g.setStroke(gridLine);
         g.setLineWidth(1.0);
         for (int x = 0; x <= GRID_W; x++) {
@@ -607,7 +607,7 @@ public final class PaperFxApp extends Application {
             g.strokeLine(0, py, GRID_W * (double) CELL, py);
         }
 
-        // trails (narrower + transparent)
+        // следы (тоньше и полупрозрачные)
         for (PlayerView pv : players.values()) {
             if (pv.trail == null || pv.trail.isEmpty()) continue;
             Color trailC = pv.color.deriveColor(0, 1, 1, 0.35);
@@ -619,23 +619,23 @@ public final class PaperFxApp extends Application {
             }
         }
 
-        // players (dot + shadow)
+        // игроки (точка + тень)
         for (PlayerView pv : players.values()) {
             double r = 7;
             double cx = pv.x + 8;
             double cy = pv.y + 8;
 
-            // shadow
+            // тень
             g.setFill(Color.rgb(0, 0, 0, 0.35));
             g.fillOval(cx - r + 1.5, cy - r + 2.0, r * 2, r * 2);
 
-            // body
+            // тело
             g.setFill(pv.color);
             g.fillOval(cx - r, cy - r, r * 2, r * 2);
         }
     }
 
-    // ---------------- profile UI ----------------
+    // ---------------- UI профиля ----------------
 
     private HBox buildProfileWidget() {
         profileDot = new StackPane();
@@ -701,7 +701,7 @@ public final class PaperFxApp extends Application {
         }
     }
 
-    // ---------------- helpers ----------------
+    // ---------------- вспомогательные функции ----------------
 
     private void appendChat(String s) {
         Platform.runLater(() -> {

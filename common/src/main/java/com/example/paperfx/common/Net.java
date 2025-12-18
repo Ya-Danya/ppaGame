@@ -4,7 +4,11 @@ import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.*;
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 
-/** JSON-lines helpers (Jackson). */
+/**
+ * Вспомогательные методы для JSON-сериализации/десериализации (Jackson).
+ * <p>
+ * Используется и в TCP JSONL-режиме, и в UDP-режиме (1 датаграмма = 1 JSON).
+ */
 public final class Net {
     private Net() {}
 

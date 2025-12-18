@@ -1,28 +1,34 @@
-# ARCHITECTURE — PaperFX (MVP)
+# ARCHITECTURE — PaperFX (актуальная версия, UDP)
 
 ## 1) Модули
 - `common/` — общие DTO и JSON-хелперы (`Net`, `Messages`)
-- `server/` — TCP сервер, комнаты, игровой цикл, Postgres persistence
-- `client/` — JavaFX клиент: рендер поля, ввод, чат, лидерборд
+- `server/` — **UDP** сервер, комнаты, игровой цикл, PostgreSQL persistence, статистика/достижения
+- `client/` — JavaFX клиент: рендер поля, ввод, чат, профиль
 
 ---
 
 ## 2) Потоки выполнения (сервер)
 
-- **Accept thread**: принимает TCP подключения и создаёт `ClientConn`
-- **ClientConn thread (на клиента)**: читает строки JSONL и передаёт в `ServerMain.onMessage(...)`
-- **Game loop thread** (`ScheduledExecutorService`):
+- **udp-receiver thread**: принимает UDP-датаграммы (`DatagramSocket.receive`) и передаёт JSON в `ClientConn.onDatagram(...)`
+- **game-loop thread** (`ScheduledExecutorService`):
   - каждые ~50мс вызывает `room.step(dt)`
-  - затем рассылает `room.broadcastState(tick)` всем подключенным в комнате
+  - затем рассылает `room.broadcastState(tick)` всем подключённым (в комнате)
+
+Сессии в UDP-режиме:
+- идентифицируются по `InetSocketAddress (ip:port)` клиента
+- хранятся в `clientsByAddr`
+- удаляются по таймауту бездействия (~90с)
 
 ```mermaid
 flowchart TD
-  A[ServerSocket.accept] --> B[ClientConn (thread)]
-  B -->|JSONL line| C[ServerMain.onMessage]
-  C --> D[Room.join / input / chatSend]
-  E[Game loop thread] --> F[Room.step(dt)]
-  E --> G[Room.broadcastState(tick)]
-  G --> B
+  A[DatagramSocket.receive] --> B[udp-receiver thread]
+  B -->|JSON| C[ClientConn.onDatagram]
+  C --> D[ServerMain.onMessage]
+  D --> E[Room.join / input / chat / profile_get]
+
+  F[game-loop thread] --> G[Room.step(dt)]
+  F --> H[Room.broadcastState(tick)]
+  H --> I[DatagramSocket.send]
 ```
 
 ---
@@ -30,18 +36,22 @@ flowchart TD
 ## 3) Игровая модель комнаты
 
 - `owners[]` — владение клетками
-- `players{playerId -> PlayerEntity}` — игроки
+- `players{playerId -> PlayerEntity}` — игроки (до 4)
 - `trailSet/trailList` у игрока — след за пределами территории
-- захват территории — flood-fill с границ (см. `game-rules.md`)
+- захват территории — flood‑fill «снаружи» (см. `game-rules.md`)
+- наблюдатели (`spectator=true`) не имеют `PlayerEntity`, но получают `state`
 
 ---
 
 ## 4) Данные и persistence
 
-Postgres таблицы (в MVP):
+PostgreSQL таблицы (актуально для текущей версии):
 - `app_users` — пользователи + `best_score`, `games_played`
 - `game_results` — история результатов (score на момент смерти/выхода)
-- `achievements` — заготовка под будущую систему достижений
+- `user_stats` — накопительная статистика (kills/area и best-метрики)
+- `achievements` — разблокированные достижения
+
+Схема взаимодействия (упрощённо):
 
 ```mermaid
 sequenceDiagram
@@ -51,5 +61,6 @@ sequenceDiagram
   S->>DB: register(username, salt, hash)
   S->>DB: login(username) + verify PBKDF2
   S->>DB: recordResult(userId, score) on death/leave
-  S->>DB: UPDATE app_users.best_score = max(best_score, score)
+  S->>DB: applyStats(dKills, dArea, bestKillsInGame, bestKillStreak) (пакетно)
+  S->>DB: unlockAchievement(userId, code) (идемпотентно)
 ```

@@ -5,16 +5,30 @@ import javax.crypto.spec.PBEKeySpec;
 import java.security.SecureRandom;
 import java.util.Base64;
 
+
+/**
+* Утилиты для безопасного хранения паролей.
+ * Используется PBKDF2-HMAC-SHA256 с солью и сравнением в постоянное время.
+*/
 public final class PasswordUtil {
     private PasswordUtil() {}
 
-    private static final SecureRandom RNG = new SecureRandom();
+    private static final SecureRandom RNG = new SecureRandom();/**
+* Генерирует криптографически стойкую соль (16 байт) и возвращает её в Base64.
+*/
+
 
     public static String newSaltBase64() {
         byte[] salt = new byte[16];
         RNG.nextBytes(salt);
         return Base64.getEncoder().encodeToString(salt);
-    }
+    }/**
+* Вычисляет PBKDF2-HMAC-SHA256 от пароля с указанной солью.
+ * @param password пароль (в открытом виде)
+ * @param saltBase64 соль в Base64
+ * @return хэш в Base64
+*/
+
 
     public static String pbkdf2Base64(String password, String saltBase64) {
         try {
@@ -26,7 +40,10 @@ public final class PasswordUtil {
         } catch (Exception e) {
             throw new RuntimeException("hash error: " + e.getMessage(), e);
         }
-    }
+    }/**
+* Сравнение строк в (приблизительно) постоянное время, чтобы уменьшить риск тайминговых атак.
+*/
+
 
     public static boolean slowEquals(String a, String b) {
         if (a == null || b == null) return false;

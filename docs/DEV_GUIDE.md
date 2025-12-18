@@ -1,10 +1,10 @@
-# DEV_GUIDE — PaperFX (MVP)
+# DEV_GUIDE — PaperFX (UDP)
 
 ## 1) Репозиторий и сборка
 - Java: 17
 - Gradle wrapper: `./gradlew`
 
-Полезные команды:
+Команды:
 ```bash
 ./gradlew clean
 ./gradlew :server:run
@@ -36,23 +36,27 @@ docker compose up -d
 - `DB_USER`
 - `DB_PASS`
 
-Set env vars (PowerShell):
+PowerShell:
 ```powershell
 $env:DB_URL="jdbc:postgresql://127.0.0.1:5433/paperfx"
 $env:DB_USER="paperfx"
 $env:DB_PASS="paperfx"
 ```
+
 Gradle таск `:server:run` подхватывает значения из `.env`, либо из окружения.
 
 ---
 
-## 4) Протокол
-Спецификация сообщений — в `PROTOCOL.md`.
+## 4) Сеть и протокол (UDP)
+- Сервер: `DatagramSocket`, порт по умолчанию `7777`
+- Клиент: `DatagramSocket` с локальным «эпемерным» портом
+- 1 UDP-датаграмма = 1 JSON-сообщение (UTF‑8)
+- Спецификация сообщений — в `PROTOCOL.md`
 
 ---
 
 ## 5) Где что менять
 - Добавление новых сообщений протокола: `common/Messages.java` + обработка в `server/ServerMain.java` и клиенте
 - Игровая логика комнаты: `server/Room.java`
-- Persistence: `server/Db.java`
+- Persistence/статистика/достижения: `server/Db.java`, `server/ServerMain.java`
 - UI/рендер и ввод: `client/PaperFxApp.java`

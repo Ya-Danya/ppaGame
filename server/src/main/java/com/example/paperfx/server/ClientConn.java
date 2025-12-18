@@ -9,10 +9,10 @@ import java.io.Closeable;
 import java.net.InetSocketAddress;
 
 /**
- * UDP-backed client session.
+ * Сессия клиента поверх UDP.
  *
- * Each session is identified by the remote UDP address (IP:port).
- * The server is responsible for receiving datagrams and calling {@link #onDatagram(String)}.
+ * Каждая сессия идентифицируется удалённым UDP-адресом (IP:порт).
+ * Сервер принимает датаграммы и вызывает {@link #onDatagram(String)}.
  */
 final class ClientConn implements Closeable {
     final ServerMain server;
@@ -30,28 +30,28 @@ final class ClientConn implements Closeable {
 
     volatile long lastChatMs = 0;
 
-    // ---- persistent profile/stats cache (loaded on login) ----
-    // All-time totals (from DB, plus in-memory pending deltas)
+    // ---- кэш профиля/статистики (загружается при входе) ----
+    // Итоговые значения за всё время (из БД + накопленные дельты в памяти)
     volatile long killsTotal = 0;
     volatile long areaTotal = 0;
 
-    // Best values (cached from DB / session)
-    volatile int bestScore = 0;          // max score ever (best_score in app_users)
-    volatile int bestKillsInGame = 0;    // max kills in a single game/session
-    volatile int bestKillStreak = 0;     // max kill streak ever
+    // Лучшие значения (кэш из БД / из текущей сессии)
+    volatile int bestScore = 0;          // лучший счёт за всё время (best_score в app_users)
+    volatile int bestKillsInGame = 0;    // максимум убийств за одну игру/сессию
+    volatile int bestKillStreak = 0;     // лучший стрик убийств за всё время
 
-    // Pending deltas to flush to DB (batched)
+    // Накопленные дельты для пакетной записи в БД
     volatile long pendingKills = 0;
     volatile long pendingArea = 0;
     volatile boolean statsDirty = false;
 
-    // Current session (since last join as a player)
+    // Текущая игровая сессия (с момента последнего входа как игрок)
     volatile int sessionKills = 0;
     volatile int currentKillStreak = 0;
     volatile int sessionMaxKillStreak = 0;
     volatile int sessionMaxScore = 0;
 
-    // Achievement cache (to avoid extra DB writes)
+    // Кэш достижений (чтобы избегать лишних записей в БД)
     final java.util.Set<String> unlockedAchievements = java.util.concurrent.ConcurrentHashMap.newKeySet();
 
     volatile long lastStatsFlushMs = 0;
@@ -86,6 +86,6 @@ final class ClientConn implements Closeable {
     }
 
     @Override public void close() {
-        // No per-client socket to close in UDP mode.
+        // В UDP-режиме нет отдельного сокета на клиента — закрывать нечего.
     }
 }

@@ -8,6 +8,11 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
 
+
+/**
+* Слой доступа к данным (PostgreSQL) для сервера PaperFX.
+ * Отвечает за регистрацию/логин, запись результатов игр, статистику и достижения.
+*/
 public final class Db {
     private final String url;
     private final String user;
@@ -21,7 +26,10 @@ public final class Db {
 
     private Connection get() throws SQLException {
         return DriverManager.getConnection(url, user, pass);
-    }
+    }/**
+* Создаёт таблицы в БД (если их ещё нет).
+*/
+
 
     public void init() throws SQLException {
         try (Connection c = get(); Statement st = c.createStatement()) {
@@ -68,7 +76,11 @@ public final class Db {
             );
 
         }
-    }
+    }/**
+* Регистрирует нового пользователя.
+ * После успешной регистрации сервер может выполнить авто-логин.
+*/
+
 
     public RegisterResult register(String username, String password) throws SQLException {
         username = normalize(username);
@@ -96,7 +108,10 @@ public final class Db {
         }
 
         return RegisterResult.ok(id.toString(), username, 0);
-    }
+    }/**
+* Проверяет логин/пароль и возвращает данные пользователя при успехе.
+*/
+
 
     public LoginResult login(String username, String password) throws SQLException {
         username = normalize(username);
@@ -194,9 +209,9 @@ public final class Db {
     }
 
     /**
-     * Applies batched stat deltas. This is designed for infrequent flushes.
-     * - kills_total and area_total are incremented by deltas.
-     * - best_* are updated using GREATEST.
+     * Применяет накопленные (пакетные) дельты статистики. Метод рассчитан на редкие «сбросы» в БД.
+     * - kills_total и area_total увеличиваются на переданные дельты.
+     * - best_* обновляются через GREATEST (берётся максимум).
      */
     public void applyStats(String userId, long addKills, long addArea, int bestKillsInGameCandidate, int bestKillStreakCandidate) throws SQLException {
         UUID uid = UUID.fromString(userId);
